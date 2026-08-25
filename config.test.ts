@@ -36,6 +36,29 @@ test("loadConfig reads config below PI_CODING_AGENT_DIR", async () => {
   }
 });
 
+test("loadConfig defaults transport to broker and accepts p2p", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+  try {
+    await withAgentDir(root, () => assert.equal(loadConfig().transport, "broker"));
+    mkdirSync(join(root, "intercom"), { recursive: true });
+    writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ transport: "p2p" }));
+    await withAgentDir(root, () => assert.equal(loadConfig().transport, "p2p"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig rejects unknown transports", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+  try {
+    mkdirSync(join(root, "intercom"), { recursive: true });
+    writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ transport: "udp" }));
+    await withAgentDir(root, () => assert.throws(() => loadConfig(), /"transport" must be "broker" or "p2p"/));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("loadConfig defaults inboundTrigger to current auto-trigger behavior", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
   try {

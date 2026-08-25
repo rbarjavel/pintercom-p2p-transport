@@ -10,7 +10,7 @@ description: |
 # Pi Intercom Skill
 
 Use this skill when you need to coordinate work across multiple pi sessions
-running on the same machine. Pi-intercom enables direct 1:1 messaging between
+using the same broker or authenticated P2P LAN transport. Pi-intercom enables direct 1:1 messaging between
 sessions for delegation, context sharing, and collaborative workflows.
 
 When you are supervising `pi-subagents`, delegated child agents can escalate to
@@ -340,7 +340,7 @@ if (!result.delivered) {
   await intercom({ action: "list" });
 }
 ```
-Replies to recently disconnected explicitly named senders can be queued by the broker and delivered if that sender reconnects with the same name and directory. Runtime-only `subagent-chat-...` aliases are not reconnect identities. New `send` calls may target a known live or recently disconnected session; blocking `ask` calls require a live target.
+With the broker transport, replies to recently disconnected explicitly named senders can be queued and delivered if that sender reconnects with the same name and directory. P2P delivery is live-only. Runtime-only `subagent-chat-...` aliases are not reconnect identities. In broker mode, new `send` calls may target a known live or recently disconnected session. P2P sends and all blocking `ask` calls require a live target.
 
 **Ask timeout**
 ```typescript
@@ -356,7 +356,7 @@ Replies to recently disconnected explicitly named senders can be queued by the b
 
 1. Check intercom is enabled: `intercom({ action: "status" })`
 2. Verify the target session has loaded pi-intercom
-3. Ensure both sessions are on the same machine (intercom is same-machine only)
+3. Broker mode requires the same machine; P2P mode requires the same LAN and `PI_INTERCOM_P2P_KEY`
 
 ### Message not delivered
 
@@ -370,11 +370,11 @@ if (!result.delivered) {
 
 ### Connection lost
 
-Sessions automatically reconnect if the broker restarts. If persistently disconnected:
+Sessions automatically reconnect if the broker restarts. P2P sessions are rediscovered over mDNS. If persistently disconnected:
 
 ```typescript
 intercom({ action: "status" })
-// Check if broker is running and restart if needed
+// In broker mode, check if the broker is running. In P2P mode, check the shared key and mDNS reachability.
 ```
 
 ## Common Workflows

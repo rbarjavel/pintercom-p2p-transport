@@ -25,8 +25,12 @@ export function getIntercomScopeId(env: NodeJS.ProcessEnv = process.env): string
 
 export type InboundTriggerPolicy = "always" | "replies" | "never";
 export type IntercomToolVisibility = "always" | "after-first-use";
+export type IntercomTransport = "broker" | "p2p";
 
 export interface IntercomConfig {
+  /** Message transport. P2P uses encrypted libp2p TCP streams discovered over mDNS. */
+  transport: IntercomTransport;
+
   /** Broker command used to spawn the broker process (e.g. "npx" or "bun") */
   brokerCommand: string;
 
@@ -60,6 +64,7 @@ export function getConfigPath(intercomDir: string = getIntercomDirPath()): strin
 }
 
 const defaults: IntercomConfig = {
+  transport: "broker",
   brokerCommand: "npx",
   brokerArgs: ["--no-install", "tsx"],
   confirmSend: false,
@@ -84,6 +89,13 @@ export function loadConfig(): IntercomConfig {
 
     const parsedConfig = parsed as Record<string, unknown>;
     const config: IntercomConfig = { ...defaults };
+
+    if (Object.hasOwn(parsedConfig, "transport")) {
+      if (parsedConfig.transport !== "broker" && parsedConfig.transport !== "p2p") {
+        throw new Error(`"transport" must be "broker" or "p2p"`);
+      }
+      config.transport = parsedConfig.transport;
+    }
 
     if (Object.hasOwn(parsedConfig, "brokerCommand")) {
       if (typeof parsedConfig.brokerCommand !== "string") {

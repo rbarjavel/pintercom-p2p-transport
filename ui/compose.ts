@@ -2,7 +2,10 @@ import type { Component, TUI } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import type { IntercomClient } from "../broker/client.ts";
+import type { P2PIntercomClient } from "../p2p/client.ts";
 import type { SessionInfo } from "../types.ts";
+
+type ActiveIntercomClient = IntercomClient | P2PIntercomClient;
 
 export interface ComposeResult {
   sent: boolean;
@@ -16,7 +19,7 @@ export class ComposeOverlay implements Component {
   private keybindings: KeybindingsManager;
   private target: SessionInfo;
   private targetLabel: string;
-  private client: IntercomClient;
+  private client: ActiveIntercomClient;
   private done: (result: ComposeResult) => void;
   private inputBuffer: string = "";
   private sending: boolean = false;
@@ -28,7 +31,7 @@ export class ComposeOverlay implements Component {
     keybindings: KeybindingsManager,
     target: SessionInfo,
     targetLabel: string,
-    client: IntercomClient,
+    client: ActiveIntercomClient,
     done: (result: ComposeResult) => void,
   ) {
     this.tui = tui;

@@ -4,7 +4,7 @@
 
 # Pi Intercom
 
-Direct 1:1 messaging between pi sessions on the same machine. Send context, findings, or requests from one session to another — whether you're driving the conversation or letting agents coordinate.
+Direct 1:1 messaging between pi sessions. Use the default same-machine broker or opt into authenticated libp2p connections discovered over mDNS on the local network.
 
 ```text
 User flow: press Alt+M or run /intercom to pick a session and send a message
@@ -24,7 +24,7 @@ Pi-intercom also integrates well with [pi-subagents](https://github.com/nicobail
 
 ## In One Minute
 
-Each pi session that has `pi-intercom` loaded and enabled connects to a tiny local broker over a local IPC transport. The broker keeps track of connected sessions and routes direct messages to the one you target by name or session ID. The extension gives you both a tool (`intercom`) and a small overlay UI (`/intercom` or `Alt+M`). Incoming messages are rendered inline inside the recipient session, can trigger a turn immediately by default, and are also stored in Pi session history as extension entries. If you want a stricter local trust posture, `inboundTrigger` can reduce or disable auto-triggering.
+Each pi session that has `pi-intercom` loaded and enabled uses the configured transport. By default, a tiny local broker tracks connected sessions and routes messages over local IPC. The optional `p2p` transport discovers sessions over mDNS and sends directly over encrypted, shared-key-authenticated libp2p TCP streams. The extension gives you both a tool (`intercom`) and a small overlay UI (`/intercom` or `Alt+M`). Incoming messages are rendered inline inside the recipient session, can trigger a turn immediately by default, and are also stored in Pi session history as extension entries. If you want a stricter local trust posture, `inboundTrigger` can reduce or disable auto-triggering.
 
 ## Install
 
@@ -52,7 +52,7 @@ A session becomes intercom-connected when all of these are true:
 - the `pi-intercom` extension is installed and loaded in that session
 - `enabled` is not set to `false` in the intercom config file, which defaults to `~/.pi/agent/intercom/config.json`
 - the session has started or reloaded after the extension was installed
-- the local broker is running or can be auto-started
+- the local broker is running or can be auto-started, or `transport` is `p2p` and `PI_INTERCOM_P2P_KEY` is set
 
 The session list only shows intercom-connected sessions, not every open Pi process on the machine.
 
@@ -393,6 +393,7 @@ Create `~/.pi/agent/intercom/config.json`:
 
 ```json
 {
+  "transport": "broker",
   "brokerCommand": "npx",
   "brokerArgs": ["--no-install", "tsx"],
   "confirmSend": false,
@@ -406,6 +407,7 @@ Create `~/.pi/agent/intercom/config.json`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
+| `transport` | `"broker"` | `"broker"` for same-machine IPC or `"p2p"` for libp2p TCP with mDNS discovery on the LAN |
 | `brokerCommand` | `"npx"` | Advanced trusted override for the broker executable. The default value is hardened internally to launch the resolved bundled `tsx` CLI through the current Node executable instead of resolving `npx` through `PATH`. |
 | `brokerArgs` | `["--no-install", "tsx"]` | Advanced trusted arguments passed to custom `brokerCommand` before the broker script path |
 | `confirmSend` | false | Show a confirmation dialog before ordinary or inferred sends from an interactive session with UI; caller-supplied `replyTo` skips it |
@@ -428,7 +430,9 @@ Custom broker commands are trusted local configuration: anyone who can edit this
 
 Pi-intercom publishes live session status automatically. Sessions register as `idle`, switch to `thinking` while the agent is running, show `tool:<name>` during tool execution, and return to `idle` on agent completion. If `status` is set in config, it is appended as context instead of replacing the lifecycle status.
 
-Set `PI_INTERCOM_SCOPE_ID` before starting Pi to opt a session into an opaque broker routing scope. The value is trimmed. Empty values are treated as unscoped. A scoped session can list, address by full ID, name, ID prefix, or cwd, receive presence and session lifecycle events, recover queued mailbox messages, and use extension-channel owner, publish, and state traffic only with sessions that registered the exact same scope. Scoped sessions and unscoped sessions do not cross this boundary. Existing unscoped behavior is unchanged when the variable is not set.
+For P2P mode, set the same secret (at least 16 characters) in `PI_INTERCOM_P2P_KEY` for every participating session, then set `"transport": "p2p"`. The secret derives the mDNS service tag and authenticates every protocol message; it is never sent on the network. P2P streams also use libp2p Noise encryption. P2P is live-only: broker mailbox delivery and extension-channel owner/state coordination remain available only with `"transport": "broker"`.
+
+Set `PI_INTERCOM_SCOPE_ID` before starting Pi to opt a session into an opaque routing scope. The value is trimmed. Empty values are treated as unscoped. A scoped session can list, address by full ID, name, ID prefix, or cwd, receive presence and session lifecycle events, recover queued mailbox messages, and use extension-channel owner, publish, and state traffic only with sessions that registered the exact same scope. Scoped sessions and unscoped sessions do not cross this boundary. Existing unscoped behavior is unchanged when the variable is not set.
 
 By default, runtime state and config live under `~/.pi/agent/intercom`. If Pi is launched with `PI_CODING_AGENT_DIR`, pi-intercom uses `$PI_CODING_AGENT_DIR/intercom` instead, including `config.json`, broker PID/lock files, sockets, and launcher state.
 
@@ -542,11 +546,11 @@ Runtime files live at `~/.pi/agent/intercom/` by default, or `$PI_CODING_AGENT_D
 - `broker.port.json` — Dynamic localhost TCP endpoint, only when Windows TCP transport is explicitly enabled
 - `config.json` — User configuration
 
-Supported `config.json` keys include `stableId` for restart-stable addressing, `status` for a custom status suffix, `inboundTrigger` (`always`, `replies`, or `never`), `toolVisibility` (`always` or `after-first-use`), `replyHint`, `confirmSend`, and advanced broker launch overrides.
+Supported `config.json` keys include `transport` (`broker` or `p2p`), `stableId` for restart-stable addressing, `status` for a custom status suffix, `inboundTrigger` (`always`, `replies`, or `never`), `toolVisibility` (`always` or `after-first-use`), `replyHint`, `confirmSend`, and advanced broker launch overrides.
 
 ## Design Decisions
 
-**Local IPC instead of TCP.** Same-machine only by design. `pi-intercom` uses Unix sockets on macOS/Linux and a named pipe on Windows, which keeps setup simple and avoids port management. Windows TCP is available only as an explicit escape hatch with `PI_INTERCOM_TRANSPORT=tcp` (or `PI_INTERCOM_TCP=1`) for environments where named pipes are blocked. In that mode the broker binds a dynamic `127.0.0.1` port, records the endpoint plus a local secret under the intercom state dir, and requires that secret before health or registration succeeds. Health replies do not echo the secret, so a random localhost process cannot discover it through the broker protocol.
+**Local IPC by default.** The broker transport is same-machine only by design. `pi-intercom` uses Unix sockets on macOS/Linux and a named pipe on Windows, which keeps setup simple and avoids port management. Windows TCP is available only as an explicit escape hatch with `PI_INTERCOM_TRANSPORT=tcp` (or `PI_INTERCOM_TCP=1`) for environments where named pipes are blocked. In that mode the broker binds a dynamic `127.0.0.1` port, records the endpoint plus a local secret under the intercom state dir, and requires that secret before health or registration succeeds. Health replies do not echo the secret, so a random localhost process cannot discover it through the broker protocol.
 
 **Auto-spawn with file lock.** The broker starts on first connection and exits after 5 seconds idle. There is no daemon to manage. A spawn lock file, keyed by PID and timestamp, prevents duplicate brokers when multiple sessions start at once.
 
@@ -558,7 +562,7 @@ Supported `config.json` keys include `stableId` for restart-stable addressing, `
 |--------|-------------|--------------|
 | **Model** | Direct 1:1 messaging | Shared chat room |
 | **Primary use** | User orchestrating sessions | Autonomous agent coordination |
-| **Discovery** | Broker-based (real-time) | File-based registry |
+| **Discovery** | Broker or LAN mDNS | File-based registry |
 | **Messages** | Private, session-to-session | Broadcast to all agents |
 | **Persistence** | In Pi session history | Shared coordination files |
 
@@ -581,6 +585,9 @@ Use pi-messenger for multi-agent swarms working on a shared task. Use pi-interco
 │   ├── spawn.ts          # Auto-spawn logic with lock file
 │   ├── spawn.test.ts     # Broker spawn tests
 │   └── paths.test.ts     # Path resolution tests
+├── p2p/
+│   ├── client.ts         # libp2p + mDNS transport
+│   └── client.test.ts    # Direct transport test
 ├── ui/
 │   ├── session-list.ts   # Session selection overlay
 │   ├── compose.ts        # Message composition overlay

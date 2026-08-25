@@ -4,6 +4,7 @@ import { randomUUID } from "crypto";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { IntercomClient, type SendResult } from "./broker/client.ts";
+import type { P2PIntercomClient } from "./p2p/client.ts";
 import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
 import { SessionListOverlay } from "./ui/session-list.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
@@ -33,6 +34,8 @@ import { fileURLToPath } from "node:url";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
 import { openProjectPane, resolveTargetInCwd, waitForProjectSession, type ProjectPaneLaunch } from "./project-agent.ts";
+
+type ActiveIntercomClient = IntercomClient | P2PIntercomClient;
 
 const INTERCOM_TOOL_NAME = "intercom";
 const INTERCOM_SKILL_PATH = realpathSync(fileURLToPath(new URL("./skills/pi-intercom/SKILL.md", import.meta.url)));
@@ -593,7 +596,7 @@ function getNamePollMs(): number {
   return 1000;
 }
 export default function piIntercomExtension(pi: ExtensionAPI) {
-  let client: IntercomClient | null = null;
+  let client: ActiveIntercomClient | null = null;
   const config: IntercomConfig = loadConfig();
   const askTimeoutMs = getAskTimeoutMs();
   const localExtensions = new Map<string, {
@@ -612,7 +615,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let lastPresenceName: string | null = null;
   let lastPresenceRuntimeFallbackAlias: boolean | null = null;
   const previousIntercomSessionId = process.env[INTERCOM_SESSION_ID_ENV];
-  let reconnectPromise: Promise<IntercomClient> | null = null;
+  let reconnectPromise: Promise<ActiveIntercomClient> | null = null;
   let reconnectPromiseGeneration: number | null = null;
   let startupConnectTimer: NodeJS.Timeout | null = null;
   let reconnectAttempt = 0;
@@ -967,7 +970,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     // context% rides the status heartbeat so peers see live usage at turn boundaries.
     client.updatePresence({ status: currentStatus(), ...currentContextUsage() });
   }
-  function currentSessionTargetMatches(to: string, resolvedTo?: string | null, activeClient?: IntercomClient): boolean {
+  function currentSessionTargetMatches(to: string, resolvedTo?: string | null, activeClient?: ActiveIntercomClient): boolean {
     const targets = new Set<string>();
     const addTarget = (target: string | undefined | null) => {
       const trimmed = target?.trim();
@@ -1086,7 +1089,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
 
-      let activeClient: IntercomClient;
+      let activeClient: ActiveIntercomClient;
       try {
         activeClient = await ensureConnected("background");
       } catch (error) {
@@ -1289,7 +1292,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       }
     })();
   }
-  function attachClientHandlers(nextClient: IntercomClient): void {
+  function attachClientHandlers(nextClient: ActiveIntercomClient): void {
     nextClient.onBrokerMessage((message: BrokerMessage) => {
       if (client !== nextClient) return;
       switch (message.type) {
@@ -1410,7 +1413,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       });
     }, getReconnectDelayMs());
   }
-  async function ensureConnected(reason: "startup" | "background" | "tool" | "overlay"): Promise<IntercomClient> {
+  async function ensureConnected(reason: "startup" | "background" | "tool" | "overlay"): Promise<ActiveIntercomClient> {
     if (!config.enabled) {
       throw new Error("Intercom disabled");
     }
@@ -1430,11 +1433,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return reconnectPromise;
     }
     const nextReconnectPromise = (async () => {
-      const nextClient = new IntercomClient();
+      const nextClient: ActiveIntercomClient = config.transport === "p2p"
+        ? new (await import("./p2p/client.ts")).P2PIntercomClient()
+        : new IntercomClient();
       client = nextClient;
       attachClientHandlers(nextClient);
       try {
-        await spawnBrokerIfNeeded(config.brokerCommand, config.brokerArgs);
+        if (config.transport === "broker") await spawnBrokerIfNeeded(config.brokerCommand, config.brokerArgs);
         await nextClient.connect(buildRegistration(), currentIntercomSessionId ?? currentSessionId);
         if (!getLiveContext(contextAtStart, generationAtStart)) {
           await nextClient.disconnect();
@@ -1462,7 +1467,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     reconnectPromiseGeneration = generationAtStart;
     return nextReconnectPromise;
   }
-  async function resolveSessionTarget(activeClient: IntercomClient, nameOrId: string): Promise<string | null> {
+  async function resolveSessionTarget(activeClient: ActiveIntercomClient, nameOrId: string): Promise<string | null> {
     const sessions = await activeClient.listSessions();
     const byId = sessions.find(s => s.id === nameOrId);
     if (byId) {
@@ -1488,7 +1493,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return null;
   }
-  async function resolveSupervisorTarget(activeClient: IntercomClient, metadata: ChildOrchestratorMetadata): Promise<string | null> {
+  async function resolveSupervisorTarget(activeClient: ActiveIntercomClient, metadata: ChildOrchestratorMetadata): Promise<string | null> {
     if (metadata.orchestratorSessionId) {
       const bySessionId = await resolveSessionTarget(activeClient, metadata.orchestratorSessionId);
       if (bySessionId) {
@@ -1497,7 +1502,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return resolveSessionTarget(activeClient, metadata.orchestratorTarget);
   }
-  async function resolveCwdDeliveryTarget(activeClient: IntercomClient, options: {
+  async function resolveCwdDeliveryTarget(activeClient: ActiveIntercomClient, options: {
     to?: string;
     cwd: string;
     openProjectPaneIfMissing?: boolean;
@@ -1646,7 +1651,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
 
-      let activeClient: IntercomClient;
+      let activeClient: ActiveIntercomClient;
       let target: string;
       try {
         activeClient = await ensureConnected("background");
@@ -1903,7 +1908,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
         const supervisorInterview = interviewValidation?.ok === true ? interviewValidation.interview : undefined;
 
-        let connectedClient: IntercomClient;
+        let connectedClient: ActiveIntercomClient;
         try {
           connectedClient = await ensureConnected("tool");
         } catch (error) {
@@ -2182,7 +2187,7 @@ Usage:
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       activateIntercomTool();
-      let connectedClient: IntercomClient;
+      let connectedClient: ActiveIntercomClient;
       try {
         connectedClient = await ensureConnected("tool");
       } catch (error) {
@@ -2685,7 +2690,7 @@ Usage:
     const commandGeneration = runtimeGeneration;
     const liveContext = getLiveContext(ctx, commandGeneration);
     if (!liveContext) return;
-    let contactClient: IntercomClient;
+    let contactClient: ActiveIntercomClient;
     try {
       contactClient = await ensureConnected("tool");
     } catch (error) {
@@ -2707,7 +2712,7 @@ Usage:
     const liveContext = getLiveContext(ctx, overlayGeneration);
     if (!liveContext?.hasUI || (liveContext as ExtensionContext & { mode?: string }).mode !== "tui") return;
 
-    let overlayClient: IntercomClient;
+    let overlayClient: ActiveIntercomClient;
     try {
       overlayClient = await ensureConnected("overlay");
     } catch (error) {
