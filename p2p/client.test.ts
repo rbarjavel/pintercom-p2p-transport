@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { P2PIntercomClient } from "./client.ts";
+import { confirmP2PListenAddresses, P2PIntercomClient } from "./client.ts";
 import type { SessionRegistration } from "../types.ts";
 
 function registration(name: string): SessionRegistration {
@@ -13,6 +13,20 @@ function registration(name: string): SessionRegistration {
     lastActivity: Date.now(),
   };
 }
+
+test("p2p confirms every bound address for link-local mDNS advertisement", () => {
+  const addresses = [{ id: "loopback" }, { id: "public-range-lan" }];
+  const confirmed: Array<{ address: unknown; type: string }> = [];
+
+  confirmP2PListenAddresses({
+    transportManager: { getAddrs: () => addresses },
+    addressManager: {
+      confirmObservedAddr: (address, { type }) => confirmed.push({ address, type }),
+    },
+  } as never);
+
+  assert.deepEqual(confirmed, addresses.map((address) => ({ address, type: "transport" })));
+});
 
 test("p2p clients exchange authenticated messages over an encrypted libp2p stream", async () => {
   const previousKey = process.env.PI_INTERCOM_P2P_KEY;

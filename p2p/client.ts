@@ -43,6 +43,21 @@ interface PeerSession {
   session: SessionInfo;
 }
 
+type ListenAddress = ReturnType<Libp2p["getMultiaddrs"]>[number];
+
+interface P2PAddressComponents {
+  transportManager: { getAddrs(): ListenAddress[] };
+  addressManager: { confirmObservedAddr(address: ListenAddress, options: { type: "transport" }): void };
+}
+
+export function confirmP2PListenAddresses(components: P2PAddressComponents): void {
+  // mDNS is link-local, so addresses the transport actually listens on are safe
+  // to advertise even when the LAN uses a public-range subnet.
+  for (const address of components.transportManager.getAddrs()) {
+    components.addressManager.confirmObservedAddr(address, { type: "transport" });
+  }
+}
+
 type PeerEnvelope =
   | { type: "hello"; scopeId?: string; session: SessionInfo }
   | { type: "message"; scopeId?: string; from: SessionInfo; to: string; message: Message }
@@ -143,6 +158,7 @@ export class P2PIntercomClient extends EventEmitter {
     });
     node.addEventListener("peer:disconnect", (event) => this.removePeer(event.detail));
     await node.start();
+    confirmP2PListenAddresses((node as Libp2p & { components: P2PAddressComponents }).components);
 
     const registered: BrokerMessage = { type: "registered", sessionId, features: [EXACT_SEND_FEATURE] };
     this.emit("broker_message", registered);
