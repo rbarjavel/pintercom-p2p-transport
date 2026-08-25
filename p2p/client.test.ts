@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { confirmP2PListenAddresses, P2PIntercomClient } from "./client.ts";
+import { confirmP2PListenAddresses, p2pMdnsAnswers, P2PIntercomClient } from "./client.ts";
 import type { SessionRegistration } from "../types.ts";
 
 function registration(name: string): SessionRegistration {
@@ -26,6 +26,14 @@ test("p2p confirms every bound address for link-local mDNS advertisement", () =>
   } as never);
 
   assert.deepEqual(confirmed, addresses.map((address) => ({ address, type: "transport" })));
+});
+
+test("p2p mDNS advertises bound public-range LAN addresses", () => {
+  const answers = p2pMdnsAnswers("_pi-intercom._udp.local", "peer", [
+    { toString: () => "/ip4/70.0.0.138/tcp/52180/p2p/peer" },
+  ]);
+
+  assert.equal(answers[1]?.data, "dnsaddr=/ip4/70.0.0.138/tcp/52180/p2p/peer");
 });
 
 test("p2p clients exchange authenticated messages over an encrypted libp2p stream", async () => {

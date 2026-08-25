@@ -58,6 +58,20 @@ export function confirmP2PListenAddresses(components: P2PAddressComponents): voi
   }
 }
 
+export function p2pMdnsAnswers(service: string, peerName: string, addresses: ReadonlyArray<{ toString(): string }>) {
+  const instance = `${peerName}.${service}`;
+  return [
+    { name: service, type: "PTR" as const, class: "IN" as const, ttl: 120, data: instance },
+    ...addresses.map((address) => ({
+      name: instance,
+      type: "TXT" as const,
+      class: "IN" as const,
+      ttl: 120,
+      data: `dnsaddr=${address.toString()}`,
+    })),
+  ];
+}
+
 type PeerEnvelope =
   | { type: "hello"; scopeId?: string; session: SessionInfo }
   | { type: "message"; scopeId?: string; from: SessionInfo; to: string; message: Message }
@@ -140,18 +154,29 @@ export class P2PIntercomClient extends EventEmitter {
     this._sessionId = sessionId;
     this.registration = { ...session, id: sessionId, endpointEpoch, trustedLocal: false };
 
+    const mdnsServiceTag = serviceTag(this.key, this.scopeId);
+    const createMdns = mdns({ serviceTag: mdnsServiceTag });
+    let mdnsService: ReturnType<typeof createMdns> | undefined;
     const node = await createLibp2p({
       start: false,
       addresses: { listen: ["/ip4/0.0.0.0/tcp/0"] },
       transports: [tcp()],
       connectionEncrypters: [noise()],
       streamMuxers: [yamux()],
-      peerDiscovery: [mdns({ serviceTag: serviceTag(this.key, this.scopeId) })],
+      peerDiscovery: [(components) => {
+        mdnsService = createMdns(components);
+        return mdnsService;
+      }],
     });
     this.node = node;
     await node.handle(PROTOCOL, (stream, connection) => this.handleStream(stream, connection));
-    node.addEventListener("peer:discovery", (event) => {
-      if (!event.detail.id.equals(node.peerId)) void this.announceToPeer(event.detail.id);
+    mdnsService?.addEventListener("peer", (event) => {
+      if (event.detail.id.equals(node.peerId)) return;
+      // mDNS can emit a private-only response before our bound-address response.
+      // Merge every response and retry only after its addresses are available.
+      void node.peerStore.merge(event.detail.id, { multiaddrs: event.detail.multiaddrs })
+        .then(() => this.announceToPeer(event.detail.id))
+        .catch(() => undefined);
     });
     node.addEventListener("peer:connect", (event) => {
       if (!event.detail.equals(node.peerId)) void this.announceToPeer(event.detail);
@@ -159,6 +184,15 @@ export class P2PIntercomClient extends EventEmitter {
     node.addEventListener("peer:disconnect", (event) => this.removePeer(event.detail));
     await node.start();
     confirmP2PListenAddresses((node as Libp2p & { components: P2PAddressComponents }).components);
+
+    // @libp2p/mdns drops public-range addresses even when they are on the local
+    // link. Add a response on its existing socket with only our bound addresses.
+    const mdnsSocket = mdnsService?.mdns;
+    mdnsSocket?.on("query", (query) => {
+      if (query.questions.some(({ name, type }) => name === mdnsServiceTag && type === "PTR")) {
+        mdnsSocket.respond(p2pMdnsAnswers(mdnsServiceTag, node.peerId.toString(), node.getMultiaddrs()));
+      }
+    });
 
     const registered: BrokerMessage = { type: "registered", sessionId, features: [EXACT_SEND_FEATURE] };
     this.emit("broker_message", registered);
