@@ -19,6 +19,9 @@ export interface SessionInfo {
   runtimeFallbackAlias?: boolean;
   cwd: string;
   model: string;
+  /** Machine identity reported by the agent process. Optional for older peers. */
+  hostname?: string;
+  os?: string;
   pid: number;
   startedAt: number;
   lastActivity: number;

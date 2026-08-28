@@ -33,6 +33,10 @@ function shortSessionId(sessionId: string): string {
   return sessionId.slice(0, 8);
 }
 
+function sessionMachine(session: SessionInfo): string {
+  return [session.hostname, session.os].filter(Boolean).join(" • ");
+}
+
 function sessionTitle(session: SessionInfo, options?: { self?: boolean; sameCwd?: boolean }): string {
   const name = session.name || "Unnamed session";
   const tags = [options?.self ? "self" : undefined, options?.sameCwd ? "same cwd" : undefined]
@@ -120,7 +124,7 @@ export class SessionListOverlay implements Component {
     lines.push(border(`├${"─".repeat(contentWidth)}┤`));
     lines.push(row());
     lines.push(row(`  ${this.theme.fg("dim", sessionTitle(this.currentSession, { self: true }))}`));
-    lines.push(row(`  ${this.theme.fg("dim", `${middleTruncate(this.currentSession.cwd, Math.max(8, contentWidth - 4))} • ${this.currentSession.model}`)}`));
+    lines.push(row(`  ${this.theme.fg("dim", `${middleTruncate(this.currentSession.cwd, Math.max(8, contentWidth - 4))} • ${[this.currentSession.model, sessionMachine(this.currentSession)].filter(Boolean).join(" • ")}`)}`));
     lines.push(row());
     lines.push(border(`├${"─".repeat(contentWidth)}┤`));
     lines.push(row(this.theme.bold(" Other Sessions")));
@@ -141,7 +145,7 @@ export class SessionListOverlay implements Component {
         const sameCwd = session.cwd === this.currentSession.cwd;
         const prefix = isSelected ? this.theme.fg("accent", "→ ") : "  ";
         const title = sessionTitle(session, { sameCwd });
-        const pathText = `${middleTruncate(session.cwd, Math.max(8, contentWidth - 4))} • ${session.model}`;
+        const pathText = `${middleTruncate(session.cwd, Math.max(8, contentWidth - 4))} • ${[session.model, sessionMachine(session)].filter(Boolean).join(" • ")}`;
 
         lines.push(row(`${prefix}${isSelected ? this.theme.fg("accent", title) : title}`));
         lines.push(row(`  ${this.theme.fg("dim", pathText)}`));

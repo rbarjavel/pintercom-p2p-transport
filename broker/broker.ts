@@ -468,6 +468,8 @@ class IntercomBroker {
           ...(session.runtimeFallbackAlias !== undefined ? { runtimeFallbackAlias: session.runtimeFallbackAlias } : {}),
           cwd: session.cwd,
           model: session.model,
+          ...(session.hostname !== undefined ? { hostname: session.hostname } : {}),
+          ...(session.os !== undefined ? { os: session.os } : {}),
           pid: session.pid,
           startedAt: session.startedAt,
           lastActivity: session.lastActivity,

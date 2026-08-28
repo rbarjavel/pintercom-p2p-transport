@@ -1,6 +1,7 @@
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
+import { hostname, type as osType } from "node:os";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { IntercomClient, type SendResult } from "./broker/client.ts";
@@ -552,7 +553,10 @@ function formatSessionListRow(session: SessionInfo, currentCwd: string, isSelf: 
     .filter((tag): tag is string => Boolean(tag));
   const suffix = tags.length ? ` [${tags.join(", ")}]` : "";
   const pane = session.tmuxPane ? ` · tmux ${session.tmuxPane}` : "";
-  return `• ${name} (${idPrefix}) — ${session.cwd} (${session.model}${formatContextUsage(session)}${pane})${suffix}`;
+  const machine = session.hostname || session.os
+    ? ` · ${[session.hostname, session.os].filter(Boolean).join(" · ")}`
+    : "";
+  return `• ${name} (${idPrefix}) — ${session.cwd} (${session.model}${formatContextUsage(session)}${pane})${machine}${suffix}`;
 }
 function previewText(value: unknown, maxLength = 72): string | undefined {
   if (typeof value !== "string") {
@@ -896,6 +900,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       ...identity,
       cwd: liveContext.cwd,
       model: currentModel,
+      hostname: hostname(),
+      os: osType(),
       pid: process.pid,
       startedAt: sessionStartedAt,
       lastActivity: Date.now(),

@@ -151,6 +151,14 @@ export function isSessionInfo(value: unknown): value is SessionInfo {
     return false;
   }
 
+  if (value.hostname !== undefined && typeof value.hostname !== "string") {
+    return false;
+  }
+
+  if (value.os !== undefined && typeof value.os !== "string") {
+    return false;
+  }
+
   if (value.status !== undefined && typeof value.status !== "string") {
     return false;
   }
@@ -198,6 +206,12 @@ export function isSessionRegistration(value: unknown): value is SessionRegistrat
     return false;
   }
   if (value.extensions !== undefined && !Array.isArray(value.extensions)) {
+    return false;
+  }
+  if (value.hostname !== undefined && typeof value.hostname !== "string") {
+    return false;
+  }
+  if (value.os !== undefined && typeof value.os !== "string") {
     return false;
   }
   if (value.tmuxPane !== undefined && typeof value.tmuxPane !== "string") {
