@@ -44,7 +44,12 @@ test("p2p clients exchange authenticated messages over an encrypted libp2p strea
 
   try {
     await sender.connect(registration("sender"), "sender-id");
-    await receiver.connect(registration("receiver"), "receiver-id");
+    await receiver.connect({
+      ...registration("receiver"),
+      hostname: "remote-device",
+      os: "Linux arm64",
+      sshRemote: "root@device.local",
+    }, "receiver-id");
 
     // Make discovery deterministic in the test; production uses the same
     // announce handshake after mDNS emits peer:discovery.
@@ -54,7 +59,13 @@ test("p2p clients exchange authenticated messages over an encrypted libp2p strea
     await Reflect.apply(Reflect.get(sender, "announceToPeer"), sender, [receiverNode.peerId]);
     await Reflect.apply(Reflect.get(receiver, "announceToPeer"), receiver, [senderNode.peerId]);
 
-    assert.deepEqual((await sender.listSessions()).map((session) => session.id).sort(), ["receiver-id", "sender-id"]);
+    const sessions = await sender.listSessions();
+    assert.deepEqual(sessions.map((session) => session.id).sort(), ["receiver-id", "sender-id"]);
+    assert.partialDeepStrictEqual(sessions.find((session) => session.id === "receiver-id"), {
+      hostname: "remote-device",
+      os: "Linux arm64",
+      sshRemote: "root@device.local",
+    });
 
     const received = new Promise<string>((resolve) => {
       receiver.once("message", (_from, message) => resolve(message.content.text));

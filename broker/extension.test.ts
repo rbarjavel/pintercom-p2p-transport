@@ -153,7 +153,17 @@ test("extension bus negotiates, routes, elects an owner, and persists state", { 
     assert.equal((await owner.listSessions()).some((session) => session.id === "owner-id"), true);
     await invalidReplacement.disconnect().catch(() => undefined);
 
-    await peer.connect(registration("peer", now, false), "peer-id");
+    await peer.connect({
+      ...registration("peer", now, false),
+      hostname: "remote-device",
+      os: "Linux arm64",
+      sshRemote: "root@device.local",
+    }, "peer-id");
+    assert.partialDeepStrictEqual((await owner.listSessions()).find((session) => session.id === "peer-id"), {
+      hostname: "remote-device",
+      os: "Linux arm64",
+      sshRemote: "root@device.local",
+    });
     await legacy.connect(registration("legacy", now), "legacy-id");
     await late.connect(registration("late", 0), "late-id");
     await peerOnlyA.connect({

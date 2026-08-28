@@ -1346,7 +1346,7 @@ test("intercom tool shows unique ID prefixes when names collide", { concurrency:
   const harness = createExtensionHarness("collision-sender");
 
   try {
-    await twinA.connect({ name: "twin", cwd: repoDir, model: "test-model", hostname: "host-a", os: "Linux", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "019fc92c-066f-755e-95d8-50ebb030d40d");
+    await twinA.connect({ name: "twin", cwd: repoDir, model: "test-model", hostname: "host-a", os: "Linux", sshRemote: "root@device.local", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "019fc92c-066f-755e-95d8-50ebb030d40d");
     await twinB.connect({ name: "twin", cwd: `${repoDir}/other`, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "019fc92c-b5f7-7536-b715-e41a4a6e9eb5");
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
@@ -1355,7 +1355,7 @@ test("intercom tool shows unique ID prefixes when names collide", { concurrency:
     const listed = await intercomTool.execute("list-twin", { action: "list" }, new AbortController().signal, undefined, harness.ctx);
     const listText = listed.content.map((part) => (part as { text?: string }).text ?? "").join("");
     assert.match(listText, /019fc92c-066f/);
-    assert.match(listText, /host-a · Linux/);
+    assert.match(listText, /SSH root@device\.local · host-a · Linux/);
     assert.match(listText, /019fc92c-b5f7/);
 
     const listedCwd = await intercomTool.execute("list-cwd-twin", { action: "list-cwd" }, new AbortController().signal, undefined, harness.ctx);

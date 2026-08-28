@@ -152,7 +152,7 @@ Targets resolve in this order:
 2. Unique case-insensitive session name.
 3. Unique session ID prefix.
 
-The roster includes live metadata such as working directory, model, status, context usage, hostname, and operating system when provided by the peer.
+The roster includes live metadata such as working directory, model, status, context usage, hostname, and operating system when provided by the peer. A locally hosted SSH agent can set `PI_SSH_REMOTE`, `PI_SSH_HOSTNAME`, and `PI_SSH_SYSTEM`; its authenticated hello then marks it as `SSH <remote>` and lists the remote device identity rather than the controller machine.
 
 ## Network Requirements
 

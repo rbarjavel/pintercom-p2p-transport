@@ -34,7 +34,9 @@ function shortSessionId(sessionId: string): string {
 }
 
 function sessionMachine(session: SessionInfo): string {
-  return [session.hostname, session.os].filter(Boolean).join(" • ");
+  return [session.sshRemote ? `SSH ${session.sshRemote}` : undefined, session.hostname, session.os]
+    .filter(Boolean)
+    .join(" • ");
 }
 
 function sessionTitle(session: SessionInfo, options?: { self?: boolean; sameCwd?: boolean }): string {

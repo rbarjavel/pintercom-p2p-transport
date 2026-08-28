@@ -19,9 +19,11 @@ export interface SessionInfo {
   runtimeFallbackAlias?: boolean;
   cwd: string;
   model: string;
-  /** Machine identity reported by the agent process. Optional for older peers. */
+  /** Logical machine identity reported by the agent. SSH-backed agents report the remote device. */
   hostname?: string;
   os?: string;
+  /** SSH destination used by a locally hosted agent whose tools execute remotely. */
+  sshRemote?: string;
   pid: number;
   startedAt: number;
   lastActivity: number;

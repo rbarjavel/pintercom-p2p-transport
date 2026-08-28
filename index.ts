@@ -553,9 +553,9 @@ function formatSessionListRow(session: SessionInfo, currentCwd: string, isSelf: 
     .filter((tag): tag is string => Boolean(tag));
   const suffix = tags.length ? ` [${tags.join(", ")}]` : "";
   const pane = session.tmuxPane ? ` · tmux ${session.tmuxPane}` : "";
-  const machine = session.hostname || session.os
-    ? ` · ${[session.hostname, session.os].filter(Boolean).join(" · ")}`
-    : "";
+  const machineParts = [session.sshRemote ? `SSH ${session.sshRemote}` : undefined, session.hostname, session.os]
+    .filter((part): part is string => Boolean(part));
+  const machine = machineParts.length ? ` · ${machineParts.join(" · ")}` : "";
   return `• ${name} (${idPrefix}) — ${session.cwd} (${session.model}${formatContextUsage(session)}${pane})${machine}${suffix}`;
 }
 function previewText(value: unknown, maxLength = 72): string | undefined {
@@ -896,12 +896,16 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
 
     const identity = buildPresenceIdentity(pi, currentIntercomSessionId ?? currentSessionId);
     const tmuxPane = currentTmuxPane();
+    const sshRemote = process.env.PI_SSH_REMOTE?.trim();
+    const sshHostname = process.env.PI_SSH_HOSTNAME?.trim();
+    const sshSystem = process.env.PI_SSH_SYSTEM?.trim();
     return {
       ...identity,
       cwd: liveContext.cwd,
       model: currentModel,
-      hostname: hostname(),
-      os: osType(),
+      hostname: sshHostname || hostname(),
+      os: sshSystem || osType(),
+      ...(sshRemote ? { sshRemote } : {}),
       pid: process.pid,
       startedAt: sessionStartedAt,
       lastActivity: Date.now(),

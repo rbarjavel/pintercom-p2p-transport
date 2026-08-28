@@ -29,6 +29,9 @@ const session: SessionInfo = {
   name: "subagent-chat-019ecaf6",
   cwd: "/Users/envvar/.config/ghostty",
   model: "bsy-deepseek-v4-pro",
+  hostname: "remote-device",
+  os: "Linux arm64",
+  sshRemote: "root@device.local",
   pid: 1,
   startedAt: 0,
   lastActivity: 0,
@@ -63,4 +66,12 @@ test("session list overlay renders lines at the declared overlay width", () => {
   for (const width of [1, 2, 20, 50, 88]) {
     assertLineWidths("session list overlay", overlay.render(width), width);
   }
+  const sshOverlay = new SessionListOverlay(
+    theme as any,
+    keybindings as any,
+    { ...session, name: "ssh-agent", cwd: "/w", model: "m" },
+    [],
+    () => {},
+  );
+  assert.match(sshOverlay.render(88).join("\n"), /SSH root@device\.local.*remote-device.*Linux arm64/);
 });

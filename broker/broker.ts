@@ -470,6 +470,7 @@ class IntercomBroker {
           model: session.model,
           ...(session.hostname !== undefined ? { hostname: session.hostname } : {}),
           ...(session.os !== undefined ? { os: session.os } : {}),
+          ...(session.sshRemote !== undefined ? { sshRemote: session.sshRemote } : {}),
           pid: session.pid,
           startedAt: session.startedAt,
           lastActivity: session.lastActivity,
