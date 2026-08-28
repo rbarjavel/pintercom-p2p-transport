@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { getIntercomDirPath } from "./broker/paths.ts";
 
-const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_ASK_TIMEOUT_MS = 60 * 60 * 1000;
 const INTERCOM_SCOPE_ID_ENV = "PI_INTERCOM_SCOPE_ID";
 
 export function getAskTimeoutMs(): number {

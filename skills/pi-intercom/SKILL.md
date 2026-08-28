@@ -189,8 +189,8 @@ This works because `reply` resolves the correct sender and message ID automatica
 
 | Type | What it means | How to respond |
 |------|---------------|----------------|
-| `need_decision` | Subagent is blocked and waiting for your answer. Uses the shared ask timeout: 10 minutes by default, configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`. | Reply promptly with a clear decision. If you need more context, ask follow-up questions via `reply`. |
-| `interview_request` | Subagent needs multiple structured answers in one blocking exchange. Uses the shared ask timeout: 10 minutes by default, configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`. | Reply with plain JSON or a fenced `json` block using the provided `{ "responses": [...] }` shape. |
+| `need_decision` | Subagent is blocked and waiting for your answer. Uses the shared ask timeout: 1 hour by default, configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`. | Reply promptly with a clear decision. If you need more context, ask follow-up questions via `reply`. |
+| `interview_request` | Subagent needs multiple structured answers in one blocking exchange. Uses the shared ask timeout: 1 hour by default, configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`. | Reply with plain JSON or a fenced `json` block using the provided `{ "responses": [...] }` shape. |
 | `progress_update` | Subagent is sharing meaningful progress or a plan-changing discovery. Not blocking. | Read and acknowledge. No reply required unless you want to redirect. |
 
 **When a subagent asks:**
@@ -232,7 +232,7 @@ new visible project panes should go through the supervisor.
 | Action | Behavior | Use When |
 |--------|----------|----------|
 | `send` | Fire-and-forget; infers the sole pending ask as its reply | You don't need a response |
-| `ask` | Blocks until reply (10 min default, configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`) | You need an answer to continue |
+| `ask` | Blocks until reply (1 hour default, configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`) | You need an answer to continue |
 | `reply` | Responds to the active or pending inbound ask | You were asked something and need to answer naturally |
 | `pending` | Lists unresolved inbound asks | You need to see who is waiting before replying |
 | `list` | Returns all sessions with live status | You need to discover targets or choose an idle peer |
@@ -252,7 +252,7 @@ Ask the user before opening another visible surface manually.
 ### `ask` Limitations
 
 - **Connected targets only**: `ask` fails immediately when the target is not in the live intercom roster. Use `list` before asking when liveness is uncertain; use `send` for non-blocking mailbox delivery.
-- **Configurable timeout**: If no reply arrives before the shared ask timeout, the ask fails. The default is 10 minutes; set `PI_INTERCOM_ASK_TIMEOUT_MS` to a positive millisecond value to change it.
+- **Configurable timeout**: If no reply arrives before the shared ask timeout, the ask fails. The default is 1 hour; set `PI_INTERCOM_ASK_TIMEOUT_MS` to a positive millisecond value to change it.
 - **One at a time**: Cannot have multiple pending asks from the same session
 - **Cannot self-target**: A session cannot ask itself, including through disconnected-mailbox remapping
 
@@ -345,7 +345,7 @@ With the broker transport, replies to recently disconnected explicitly named sen
 **Ask timeout**
 ```typescript
 // The ask will reject with a timeout error
-// Default: 10 minutes
+// Default: 1 hour
 // Override: set PI_INTERCOM_ASK_TIMEOUT_MS to a positive millisecond value
 // For longer tasks, use send + follow-up ask pattern
 ```
