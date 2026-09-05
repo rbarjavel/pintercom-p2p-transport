@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { visibleWidth, matchesKey } from "@earendil-works/pi-tui";
+import { Markdown, visibleWidth, matchesKey } from "@earendil-works/pi-tui";
+import { getMarkdownTheme, initTheme } from "@earendil-works/pi-coding-agent";
+import { stripVTControlCharacters } from "node:util";
+
+initTheme("dark", false);
 import { MessageHistoryOverlay, readHistory } from "../ui/message-history.ts";
 import { ComposeOverlay } from "../ui/compose.ts";
 import { SessionListOverlay } from "../ui/session-list.ts";
@@ -178,7 +182,8 @@ test("Tab expands only the selection and source text stays anchored on resize", 
   }
 });
 
-test("arrow keys read overflowing expanded content before selecting another message", () => {
+for (const [up, down, end] of [["\x1b[A", "\x1b[B", "\x1b[F"], ["k", "j", "G"]])
+test(`${down} navigation reads expanded content before selecting another message`, () => {
   const entries = [sent("long", Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n")), sent("next", "next message")];
   const tui = { terminal: { rows: 8 }, requestRender() {} };
   const keys = { matches: (data: string, id: string) => matchesKey(data, id.split(".").at(-1) as any) };
@@ -194,7 +199,7 @@ test("arrow keys read overflowing expanded content before selecting another mess
         const match = line.match(/│ line (\d+)/);
         if (match) seen.add(Number(match[1]));
       }
-      overlay.handleInput("\x1b[B");
+      overlay.handleInput(down);
     }
     const bottom = overlay.render(120).join("\n");
     assert.match(bottom, /│ line 19/);
@@ -202,15 +207,43 @@ test("arrow keys read overflowing expanded content before selecting another mess
     for (const match of bottom.matchAll(/│ line (\d+)/g)) seen.add(Number(match[1]));
     assert.equal(seen.size, 20, "every body line is reachable with Down");
     for (let i = 0; i < 15; i++) {
-      overlay.handleInput("\x1b[A");
+      overlay.handleInput(up);
       overlay.render(120);
     }
     assert.deepEqual(overlay.render(120).slice(1, -1), top, "Up scrolls back to the expanded header");
     for (let i = 0; i < 16; i++) {
-      overlay.handleInput("\x1b[B");
+      overlay.handleInput(down);
       overlay.render(120);
     }
     assert.match(overlay.render(120).join("\n"), /> ▸ MESSAGE[^\n]*\n  next message/);
+    overlay.handleInput(end);
+    assert.match(overlay.render(120).join("\n"), /LIVE[\s\S]*next message/);
+  } finally {
+    overlay.dispose();
+  }
+});
+
+test("expanded bodies use Pi Markdown with highlighted code and width-safe formatting", () => {
+  const source = "# Heading\n\nSome **bold** and `inline code`.\n\n- first\n- second\n\n> quote\n\n```typescript\nconst answer = 42;\n```\n\n[link](https://example.com)\n\n| A | B |\n|---|---|\n| 中文 | value |";
+  const tui = { terminal: { rows: 100 }, requestRender() {} };
+  const keys = { matches: (data: string, id: string) => matchesKey(data, id.split(".").at(-1) as any) };
+  const overlay = new MessageHistoryOverlay(tui as any, theme as any, keys as any, () => [sent("md", source)] as any, () => {});
+  try {
+    overlay.render(80);
+    overlay.handleInput("\t");
+    for (const width of [80, 30, 8, 2, 1]) {
+      const lines = overlay.render(width);
+      assertLineWidths("markdown history", lines, width);
+      if (width >= 30) {
+        const expected = new Markdown(source, 0, 0, getMarkdownTheme(), { color: value => value }).render(width - 2);
+        assert.deepEqual(lines.slice(2, 2 + expected.length).map(line => line.trimEnd()), expected.map(line => `│ ${line}`.trimEnd()));
+        const rendered = lines.join("\n");
+        assert.doesNotMatch(stripVTControlCharacters(rendered), /\*\*bold\*\*/);
+        assert.match(rendered, /\x1b\[/, "Pi adds trusted styling and syntax highlighting");
+      }
+    }
+    overlay.invalidate();
+    assertLineWidths("invalidated markdown", overlay.render(80), 80);
   } finally {
     overlay.dispose();
   }
@@ -219,7 +252,7 @@ test("arrow keys read overflowing expanded content before selecting another mess
 test("message and response colors persist through selection and expansion", () => {
   const entries = [sent("question", "question body"), sent("reply", "reply body")];
   Object.assign(entries[1].data.message, { replyTo: "question" });
-  const colors: Record<string, string> = { accent: "\x1b[36m", success: "\x1b[32m" };
+  const colors: Record<string, string> = { accent: "\x1b[36m", success: "\x1b[32m", text: "\x1b[37m" };
   const coloredTheme = { fg: (color: string, value: string) => `${colors[color] ?? ""}${value}\x1b[0m` };
   const tui = { terminal: { rows: 10 }, requestRender() {} };
   const keys = { matches: (data: string, id: string) => matchesKey(data, id.split(".").at(-1) as any) };
@@ -228,11 +261,14 @@ test("message and response colors persist through selection and expansion", () =
     for (const key of ["", "\t", "\x1b[A", "\t"]) {
       if (key) overlay.handleInput(key);
       const lines = overlay.render(120);
-      for (const line of lines.filter(line => /MESSAGE|question body/.test(line))) {
+      for (const line of lines.filter(line => /MESSAGE/.test(line))) {
         assert.ok(line.startsWith(colors.accent), "messages use accent even when selected");
       }
-      for (const line of lines.filter(line => /RESPONSE|reply body/.test(line))) {
+      for (const line of lines.filter(line => /RESPONSE/.test(line))) {
         assert.ok(line.startsWith(colors.success), "responses retain their distinct color");
+      }
+      for (const line of lines.filter(line => /question body|reply body/.test(line))) {
+        assert.ok(line.includes(colors.text), "previews and expanded bodies use normal text color");
       }
       assertLineWidths("colored history", lines, 120);
     }

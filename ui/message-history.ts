@@ -1,6 +1,6 @@
 import { stripVTControlCharacters } from "node:util";
-import type { ExtensionContext, KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
-import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TUI } from "@earendil-works/pi-tui";
+import { getMarkdownTheme, type ExtensionContext, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
+import { Markdown, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 
 export interface HistoryMessage {
   id: string;
@@ -58,7 +58,7 @@ export function readHistory(entries: readonly unknown[]): HistoryMessage[] {
 interface HistoryRow {
   message: HistoryMessage;
   paragraph: number; // -1 is the message header
-  char: number; // Source position, independent of terminal width
+  char: number; // Visible non-whitespace text position, independent of wrapping
   text: string;
 }
 
@@ -109,7 +109,7 @@ export class MessageHistoryOverlay implements Component {
       return;
     }
     const selected = this.messages.findIndex(message => message.id === this.selectedId);
-    if (matchesKey(data, "end")) {
+    if (matchesKey(data, "end") || matchesKey(data, "shift+g")) {
       this.following = true;
       this.unseen = 0;
       this.selectedId = this.messages.at(-1)?.id;
@@ -125,8 +125,8 @@ export class MessageHistoryOverlay implements Component {
       this.offset = Math.max(0, Math.min(this.offset + delta, Math.max(0, this.rows.length - this.pageSize)));
     } else {
       let index = selected;
-      if (this.keys.matches(data, "tui.select.up")) index--;
-      else if (this.keys.matches(data, "tui.select.down")) index++;
+      if (this.keys.matches(data, "tui.select.up") || matchesKey(data, "k")) index--;
+      else if (this.keys.matches(data, "tui.select.down") || matchesKey(data, "j")) index++;
       else if (matchesKey(data, "home")) index = 0;
       else return;
       this.following = false;
@@ -159,14 +159,15 @@ export class MessageHistoryOverlay implements Component {
       if (!expanded) {
         rows.push({ message, paragraph: 0, char: 0, text: `  ${truncateToWidth(message.text.replace(/\s+/g, " "), Math.max(1, width - 2))}` });
       } else {
-        message.text.split("\n").forEach((paragraph, index) => {
-          let cursor = 0;
-          for (const line of wrapTextWithAnsi(paragraph, Math.max(1, width - 2))) {
-            const char = Math.max(cursor, paragraph.indexOf(line, cursor));
-            rows.push({ message, paragraph: index, char, text: `│ ${line}` });
-            cursor = char + line.length;
-          }
+        const markdown = new Markdown(message.text, 0, 0, getMarkdownTheme(), {
+          color: value => this.theme.fg("text", value),
         });
+        let cursor = 0;
+        for (const line of markdown.render(Math.max(1, width - 2))) {
+          rows.push({ message, paragraph: 0, char: cursor, text: `│ ${line}` });
+          // Ignore whitespace and layout borders so rewrapping doesn't shift the anchor.
+          cursor += stripVTControlCharacters(line).replace(/[\s│─┌┐└┘├┤┬┴┼]/g, "").length;
+        }
       }
       return rows;
     });
@@ -196,14 +197,15 @@ export class MessageHistoryOverlay implements Component {
     const body = this.rows.slice(this.offset, this.offset + this.pageSize).map(row => {
       const selected = row.message.id === this.selectedId;
       const content = row.paragraph === -1 ? `${selected ? ">" : " "} ${row.text}` : row.text;
-      return this.theme.fg(row.message.response ? "success" : "accent", content);
+      if (row.paragraph === -1) return this.theme.fg(row.message.response ? "success" : "accent", content);
+      return this.expanded.has(row.message.id) ? content : this.theme.fg("text", content);
     });
     if (!this.rows.length && this.pageSize) body.push("No intercom messages recorded in this session yet.");
     while (body.length < this.pageSize) body.push("");
     const rows = [
       this.theme.fg("accent", `INTERCOM · all branches · ${this.messages.length} recorded messages · ${status}`),
       ...body,
-      this.theme.fg("dim", "↑↓ select/scroll · Tab expand/collapse · PgUp/PgDn scroll · End live · Alt+I/Esc close"),
+      this.theme.fg("dim", "↑↓/jk select/scroll · Tab toggle · PgUp/PgDn scroll · End/G live · Esc close"),
     ];
     return rows.slice(0, height).map(line => {
       const clipped = truncateToWidth(line, width, "");

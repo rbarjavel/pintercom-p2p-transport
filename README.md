@@ -109,8 +109,9 @@ Press **Alt+I** or run `/intercom-history` to toggle a fullscreen, read-only tim
 
 - Messages start **collapsed**, with a one-line preview. **↑/↓** selects a message; **Tab** expands/collapses it. For expanded messages, **↑/↓** scrolls through hidden content before selecting the previous/next message.
 - **PgUp/PgDn** scroll through expanded content; **Home** selects the first message. Browsing or expanding pauses following, not incoming updates. Resizing preserves the source-text reading position.
-- **End** selects the latest message and resumes following. New messages remain collapsed and are counted while paused.
-- **MESSAGE** and **↳ RESPONSE** labels distinguish ordinary messages from recorded replies; responses also use a distinct color.
+- **End** or **G** selects the latest message and resumes following. New messages remain collapsed and are counted while paused.
+- Vim aliases **j/k** work alongside **↓/↑** for selection and scrolling; **Tab** still expands/collapses.
+- **MESSAGE** and **↳ RESPONSE** headers use distinct colors. Previews and ordinary body text use the normal text color. Expanded bodies use Pi’s Markdown renderer for headings, lists, tables, links, and syntax-highlighted fenced code.
 - **Esc** or **Alt+I** closes the view without changing your draft or stopping agents.
 
 History uses existing session records (including other branches, inherited fork history, and pre-compaction entries), in local recording order. It refreshes every 250 ms while open and works offline with saved history. LIVE means following recorded messages, not proof of delivery or processing. Incoming messages appear once recorded by Pi; timestamps come from the original message/record and may reflect different clocks. Replies are identified by reply metadata or saved ask-waiter records, never inferred from wording. Attachments show names only; exchanges solely between other sessions are not included.
