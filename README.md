@@ -111,6 +111,7 @@ Press **Alt+I** or run `/intercom-history` to toggle a fullscreen, read-only tim
 - **PgUp/PgDn** scroll through expanded content; **Home** goes to the expanded message’s top (or selects the first message when collapsed). Browsing or expanding pauses following, not incoming updates. Resizing preserves the source-text reading position.
 - **End** or **G** goes to the expanded message’s bottom; when collapsed, it selects the latest message and resumes following. New messages remain collapsed and are counted while paused.
 - Vim aliases **j/k** work alongside **↓/↑** for selection and scrolling; **Tab** still expands/collapses.
+- Peer names get random colors that stay stable while the viewer is open; **local** is white. The twelve-color palette is reused after twelve peers. Known, unambiguous names and short IDs share their peer’s color.
 - **MESSAGE** and **↳ RESPONSE** headers use distinct colors. Previews and ordinary body text use the normal text color. Expanded bodies use Pi’s Markdown renderer for headings, lists, tables, links, and syntax-highlighted fenced code.
 - **Esc** or **Alt+I** closes the view without changing your draft or stopping agents.
 

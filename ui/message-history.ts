@@ -9,6 +9,7 @@ export interface HistoryMessage {
   timestamp: number;
   text: string;
   response: boolean;
+  peerId: string;
 }
 
 const object = (value: unknown): Record<string, unknown> =>
@@ -20,6 +21,7 @@ const label = (value: string): string => clean(value).replace(/\s+/g, " ");
 
 export function readHistory(entries: readonly unknown[]): HistoryMessage[] {
   const messages = new Map<string, HistoryMessage>();
+  const peers = new Map<string, string>();
   for (const raw of entries) {
     const entry = object(raw);
     const custom = entry.type === "message" ? object(entry.message) : entry;
@@ -34,12 +36,13 @@ export function readHistory(entries: readonly unknown[]): HistoryMessage[] {
     const id = `${direction}:${text(data.messageId) || text(message.id) || text(entry.id)}`;
     // intercom_received records are replies consumed by ask waiters, including legacy records without replyTo.
     const response = Boolean(text(message.replyTo)) || entry.customType === "intercom_received";
+    const sender = object(data.from);
+    if (text(sender.id)) peers.set(text(sender.id), text(sender.name));
     const existing = messages.get(id);
     if (existing) {
       existing.response ||= response;
       continue;
     }
-    const sender = object(data.from);
     const timestamp = inbound ? message.timestamp : data.timestamp;
     const attachments = Array.isArray(content.attachments) ? content.attachments : [];
     messages.set(id, {
@@ -49,10 +52,17 @@ export function readHistory(entries: readonly unknown[]): HistoryMessage[] {
       timestamp: typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : Date.parse(text(entry.timestamp)),
       text: clean(content.text + attachments.map(a => `\n[Attachment: ${text(object(a).name) || "unnamed"}]`).join("")),
       response,
+      peerId: direction === "out" ? text(data.to) : text(sender.id) || text(data.from),
     });
   }
   // Session append order is the local chronology; remote clocks can drift.
-  return [...messages.values()];
+  return [...messages.values()].map(message => {
+    // Saved sends may contain a name or short ID; resolve only unambiguous aliases.
+    const matches = [...peers].filter(([id, name]) => message.peerId === id || message.peerId === name
+      || (message.peerId.length >= 4 && id.startsWith(message.peerId)));
+    if (matches.length === 1) message.peerId = matches[0][0];
+    return message;
+  });
 }
 
 interface HistoryRow {
@@ -66,6 +76,8 @@ export class MessageHistoryOverlay implements Component {
   private messages: HistoryMessage[] = [];
   private rows: HistoryRow[] = [];
   private expanded = new Set<string>();
+  private peerColors = new Map<string, number>();
+  private availableColors = [39, 45, 75, 81, 111, 141, 171, 207, 203, 215, 221, 155];
   private selectedId: string | undefined;
   private revealSelection = false;
   private width = -1;
@@ -94,6 +106,17 @@ export class MessageHistoryOverlay implements Component {
     this.entryCount = entries.length;
     const next = readHistory(entries);
     if (!this.following) this.unseen += Math.max(0, next.length - this.messages.length);
+    for (const message of next) {
+      const name = message.id.startsWith("out:") ? message.to : message.from;
+      let color = this.peerColors.get(message.peerId) ?? this.peerColors.get(name);
+      if (color === undefined) {
+        // ponytail: twelve distinct colors, reuse once the palette is exhausted.
+        if (!this.availableColors.length) this.availableColors = [39, 45, 75, 81, 111, 141, 171, 207, 203, 215, 221, 155];
+        color = this.availableColors.splice(Math.floor(Math.random() * this.availableColors.length), 1)[0];
+      }
+      this.peerColors.set(message.peerId, color);
+      this.peerColors.set(name, color);
+    }
     this.messages = next;
     if (this.following) this.selectedId = next.at(-1)?.id;
     this.invalidate();
@@ -160,7 +183,7 @@ export class MessageHistoryOverlay implements Component {
       const expanded = this.expanded.has(message.id);
       const kind = message.response ? "↳ RESPONSE" : "MESSAGE";
       const rows: HistoryRow[] = [{ message, paragraph: -1, char: 0,
-        text: `${expanded ? "▾" : "▸"} ${kind} · ${time} · ${message.from} → ${message.to}` }];
+        text: `${expanded ? "▾" : "▸"} ${kind} · ${time} · ` }];
       if (!expanded) {
         rows.push({ message, paragraph: 0, char: 0, text: `  ${truncateToWidth(message.text.replace(/\s+/g, " "), Math.max(1, width - 2))}` });
       } else {
@@ -204,7 +227,13 @@ export class MessageHistoryOverlay implements Component {
     const body = this.rows.slice(this.offset, this.offset + this.pageSize).map(row => {
       const selected = row.message.id === this.selectedId;
       const content = row.paragraph === -1 ? `${selected ? ">" : " "} ${row.text}` : row.text;
-      if (row.paragraph === -1) return this.theme.fg(row.message.response ? "success" : "accent", content);
+      if (row.paragraph === -1) {
+        const color = row.message.response ? "success" : "accent";
+        const outgoing = row.message.id.startsWith("out:");
+        const name = (value: string, local: boolean) => `\x1b[${local ? "97" : `38;5;${this.peerColors.get(row.message.peerId)}`}m${value}\x1b[39m`;
+        return this.theme.fg(color, content) + name(row.message.from, outgoing)
+          + this.theme.fg(color, " → ") + name(row.message.to, !outgoing);
+      }
       return this.expanded.has(row.message.id) ? content : this.theme.fg("text", content);
     });
     if (!this.rows.length && this.pageSize) body.push("No intercom messages recorded in this session yet.");

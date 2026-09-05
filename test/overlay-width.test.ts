@@ -243,6 +243,42 @@ test(`${down === "j" ? "Vim" : "Arrow"} navigation stays locked until collapse`,
   }
 });
 
+test("peer name colors are distinct, stable, and shared by short IDs and reply names", async () => {
+  const first = sent("one", "plain body");
+  first.data.to = "peer0001";
+  const second = sent("two", "another body");
+  second.data.to = "peer0002";
+  const entries: unknown[] = [first, second];
+  const tui = { terminal: { rows: 20 }, requestRender() {} };
+  const keys = { matches: (data: string, id: string) => matchesKey(data, id.split(".").at(-1) as any) };
+  const overlay = new MessageHistoryOverlay(tui as any, theme as any, keys as any, () => entries as any, () => {});
+  const colorOf = (output: string, name: string) => {
+    const match = output.match(new RegExp(`\\x1b\\[38;5;(\\d+)m${name}\\x1b\\[39m`));
+    assert.ok(match, `colored peer name: ${name}`);
+    return match[1];
+  };
+  try {
+    const before = overlay.render(160).join("\n");
+    const firstColor = colorOf(before, "peer0001");
+    assert.notEqual(firstColor, colorOf(before, "peer0002"));
+    assert.ok(before.includes("\x1b[97mlocal\x1b[39m"));
+    assert.ok(before.includes("\n  plain body"), "body is not assigned a peer color");
+    entries.push({ type: "custom_message", customType: "intercom_message", details: {
+      from: { id: "peer0001-full", name: "Alpha" },
+      message: { id: "reply", replyTo: "one", timestamp: 2, content: { text: "response body" } },
+    } });
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const after = overlay.render(160).join("\n");
+    assert.equal(colorOf(after, "Alpha"), firstColor);
+    assert.equal(colorOf(after, "peer0001"), firstColor);
+    overlay.invalidate();
+    assert.equal(colorOf(overlay.render(160).join("\n"), "Alpha"), firstColor);
+    assertLineWidths("peer colors", overlay.render(25), 25);
+  } finally {
+    overlay.dispose();
+  }
+});
+
 test("expanded bodies use Pi Markdown with highlighted code and width-safe formatting", () => {
   const source = "# Heading\n\nSome **bold** and `inline code`.\n\n- first\n- second\n\n> quote\n\n```typescript\nconst answer = 42;\n```\n\n[link](https://example.com)\n\n| A | B |\n|---|---|\n| 中文 | value |";
   const tui = { terminal: { rows: 100 }, requestRender() {} };
