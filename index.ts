@@ -2070,7 +2070,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           const structuredReply = reason === "interview_request" ? parseStructuredSupervisorReply(replyText, supervisorInterview!) : undefined;
           pi.appendEntry("intercom_received", {
             from: metadata.orchestratorTarget,
-            message: { text: replyText, attachments: replyMessage.content.attachments },
+            message: { text: replyText, attachments: replyMessage.content.attachments, replyTo: replyMessage.replyTo },
             messageId: replyMessage.id,
             timestamp: replyMessage.timestamp,
             subagent: { runId: metadata.runId, agent: metadata.agent, index: metadata.index },
@@ -2532,7 +2532,7 @@ Usage:
               : "";
             pi.appendEntry("intercom_received", {
               from: targetDisplay,
-              message: { text: replyText, attachments: replyMessage.content.attachments },
+              message: { text: replyText, attachments: replyMessage.content.attachments, replyTo: replyMessage.replyTo },
               messageId: replyMessage.id,
               timestamp: replyMessage.timestamp,
             });

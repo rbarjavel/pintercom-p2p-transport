@@ -98,9 +98,16 @@ test("history restores all record formats, deduplicates and sanitizes peer text"
   assert.equal(messages[0].text, "hello!");
   assert.equal(messages[1].from, "builder");
   assert.equal(messages[1].text, "answer\n[Attachment: a.ts]");
+  assert.equal(messages[0].response, false);
+  assert.equal(messages[1].response, true);
+  const reply = sent("reply");
+  Object.assign(reply.data.message, { replyTo: "one" });
+  assert.equal(readHistory([reply])[0].response, true);
+  assert.equal(readHistory([{ type: "custom_message", customType: "intercom_message",
+    details: { ...details, message: { ...details.message, replyTo: "one" } } }])[0].response, true);
 });
 
-test("history follows arrivals, pauses while reading, resizes and closes", async () => {
+test("history follows arrivals, pauses while selecting, resizes and closes", async () => {
   const entries = Array.from({ length: 10 }, (_, i) => sent(String(i), `message ${i} 中文`));
   const tui = { terminal: { rows: 8 }, requestRender() {} };
   const keys = { matches: (data: string, id: string) => matchesKey(data, id.split(".").at(-1) as any) };
@@ -108,6 +115,9 @@ test("history follows arrivals, pauses while reading, resizes and closes", async
   const overlay = new MessageHistoryOverlay(tui as any, theme as any, keys as any, () => entries as any, () => { closed = true; });
   try {
     assert.match(overlay.render(100).join("\n"), /message 9/);
+    assert.match(overlay.render(100).join("\n"), /> ▸ MESSAGE/);
+    overlay.handleInput("\x1b[A"); // Up selects previous message
+    assert.match(overlay.render(100).join("\n"), /> ▸ MESSAGE[^\n]*\n  message 8/);
     overlay.handleInput("\x1b[H"); // Home
     const body = overlay.render(100).slice(1, -1);
     entries.push(sent("new", "new arrival"));
@@ -126,6 +136,43 @@ test("history follows arrivals, pauses while reading, resizes and closes", async
     }
     overlay.handleInput("\x1bi");
     assert.equal(closed, true);
+  } finally {
+    overlay.dispose();
+  }
+});
+
+test("Tab expands only the selection and source text stays anchored on resize", async () => {
+  const longText = Array.from({ length: 300 }, (_, i) => `token${String(i).padStart(3, "0")}`).join(" ");
+  const entries = [sent("first", longText), sent("second", "reply body\nhidden second line")];
+  Object.assign(entries[1].data.message, { replyTo: "first" });
+  const tui = { terminal: { rows: 8 }, requestRender() {} };
+  const keys = { matches: (data: string, id: string) => matchesKey(data, id.split(".").at(-1) as any) };
+  const overlay = new MessageHistoryOverlay(tui as any, theme as any, keys as any, () => entries as any, () => {});
+  try {
+    const collapsed = overlay.render(120).join("\n");
+    assert.match(collapsed, /▸ MESSAGE/);
+    assert.match(collapsed, /▸ ↳ RESPONSE/);
+    assert.doesNotMatch(collapsed, /│ hidden second line/);
+    overlay.handleInput("\t");
+    assert.match(overlay.render(120).join("\n"), /▾ ↳ RESPONSE[\s\S]*│ hidden second line/);
+    overlay.handleInput("\t");
+    assert.doesNotMatch(overlay.render(120).join("\n"), /│ hidden second line/);
+    overlay.handleInput("\x1b[H");
+    overlay.handleInput("\t");
+    overlay.render(40);
+    overlay.handleInput("\x1b[6~"); // Page down inside expanded first message
+    const anchor = overlay.render(40)[1].match(/token\d+/)?.[0];
+    assert.ok(anchor, "viewport starts within a wrapped body");
+    assert.ok(overlay.render(75)[1].includes(anchor), "widening keeps the original source position visible");
+    const newAnchor = overlay.render(75)[1].match(/token\d+/)?.[0];
+    assert.ok(newAnchor);
+    assert.ok(overlay.render(30)[1].includes(newAnchor), "narrowing keeps the source position visible");
+    const beforeArrival = overlay.render(30).slice(1, -1);
+    entries.push(sent("third", "fresh message"));
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.deepEqual(overlay.render(30).slice(1, -1), beforeArrival);
+    overlay.handleInput("\x1b[F");
+    assert.match(overlay.render(120).join("\n"), /LIVE[\s\S]*> ▸ MESSAGE[\s\S]*fresh message/);
   } finally {
     overlay.dispose();
   }

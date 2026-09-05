@@ -8,6 +8,7 @@ export interface HistoryMessage {
   to: string;
   timestamp: number;
   text: string;
+  response: boolean;
 }
 
 const object = (value: unknown): Record<string, unknown> =>
@@ -15,6 +16,7 @@ const object = (value: unknown): Record<string, unknown> =>
 const text = (value: unknown): string => typeof value === "string" ? value : "";
 // Peer content is text, never terminal commands (including OSC clipboard sequences).
 const clean = (value: string): string => stripVTControlCharacters(value).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "").replace(/\t/g, "    ");
+const label = (value: string): string => clean(value).replace(/\s+/g, " ");
 
 export function readHistory(entries: readonly unknown[]): HistoryMessage[] {
   const messages = new Map<string, HistoryMessage>();
@@ -30,25 +32,42 @@ export function readHistory(entries: readonly unknown[]): HistoryMessage[] {
     if (typeof content.text !== "string") continue;
     const direction = entry.customType === "intercom_sent" ? "out" : "in";
     const id = `${direction}:${text(data.messageId) || text(message.id) || text(entry.id)}`;
-    if (messages.has(id)) continue;
+    // intercom_received records are replies consumed by ask waiters, including legacy records without replyTo.
+    const response = Boolean(text(message.replyTo)) || entry.customType === "intercom_received";
+    const existing = messages.get(id);
+    if (existing) {
+      existing.response ||= response;
+      continue;
+    }
     const sender = object(data.from);
     const timestamp = inbound ? message.timestamp : data.timestamp;
     const attachments = Array.isArray(content.attachments) ? content.attachments : [];
     messages.set(id, {
       id,
-      from: direction === "out" ? "this session" : clean(text(data.from) || text(sender.name) || text(sender.id) || "unknown"),
-      to: direction === "in" ? "this session" : clean(text(data.to) || "unknown"),
+      from: direction === "out" ? "local" : label(text(data.from) || text(sender.name) || text(sender.id) || "unknown"),
+      to: direction === "in" ? "local" : label(text(data.to) || "unknown"),
       timestamp: typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : Date.parse(text(entry.timestamp)),
       text: clean(content.text + attachments.map(a => `\n[Attachment: ${text(object(a).name) || "unnamed"}]`).join("")),
+      response,
     });
   }
   // Session append order is the local chronology; remote clocks can drift.
   return [...messages.values()];
 }
 
+interface HistoryRow {
+  message: HistoryMessage;
+  paragraph: number; // -1 is the message header
+  char: number; // Source position, independent of terminal width
+  text: string;
+}
+
 export class MessageHistoryOverlay implements Component {
   private messages: HistoryMessage[] = [];
-  private lines: string[] = [];
+  private rows: HistoryRow[] = [];
+  private expanded = new Set<string>();
+  private selectedId: string | undefined;
+  private revealSelection = false;
   private width = -1;
   private offset = 0;
   private pageSize = 1;
@@ -76,6 +95,7 @@ export class MessageHistoryOverlay implements Component {
     const next = readHistory(entries);
     if (!this.following) this.unseen += Math.max(0, next.length - this.messages.length);
     this.messages = next;
+    if (this.following) this.selectedId = next.at(-1)?.id;
     this.invalidate();
     this.tui.requestRender();
   }
@@ -88,49 +108,94 @@ export class MessageHistoryOverlay implements Component {
       this.done();
       return;
     }
+    const selected = this.messages.findIndex(message => message.id === this.selectedId);
     if (matchesKey(data, "end")) {
       this.following = true;
       this.unseen = 0;
+      this.selectedId = this.messages.at(-1)?.id;
+    } else if (matchesKey(data, "tab")) {
+      if (!this.selectedId) return;
+      this.following = false;
+      if (!this.expanded.delete(this.selectedId)) this.expanded.add(this.selectedId);
+      this.revealSelection = true;
+      this.invalidate();
+    } else if (this.keys.matches(data, "tui.select.pageUp") || this.keys.matches(data, "tui.select.pageDown")) {
+      this.following = false;
+      const delta = this.keys.matches(data, "tui.select.pageUp") ? -this.pageSize : this.pageSize;
+      this.offset = Math.max(0, Math.min(this.offset + delta, Math.max(0, this.rows.length - this.pageSize)));
     } else {
-      let delta = 0;
-      if (this.keys.matches(data, "tui.select.up")) delta = -1;
-      else if (this.keys.matches(data, "tui.select.down")) delta = 1;
-      else if (this.keys.matches(data, "tui.select.pageUp")) delta = -this.pageSize;
-      else if (this.keys.matches(data, "tui.select.pageDown")) delta = this.pageSize;
-      else if (matchesKey(data, "home")) delta = -this.lines.length;
+      let index = selected;
+      if (this.keys.matches(data, "tui.select.up")) index--;
+      else if (this.keys.matches(data, "tui.select.down")) index++;
+      else if (matchesKey(data, "home")) index = 0;
       else return;
       this.following = false;
-      this.offset = Math.max(0, Math.min(this.offset + delta, Math.max(0, this.lines.length - this.pageSize)));
+      this.selectedId = this.messages[Math.max(0, Math.min(index, this.messages.length - 1))]?.id;
+      this.revealSelection = true;
     }
     this.tui.requestRender();
+  }
+
+  private reflow(width: number): void {
+    const anchor = this.rows[this.offset];
+    this.rows = this.messages.flatMap(message => {
+      const date = new Date(message.timestamp);
+      const time = Number.isNaN(date.getTime()) ? "--:--" : date.toLocaleString();
+      const expanded = this.expanded.has(message.id);
+      const kind = message.response ? "↳ RESPONSE" : "MESSAGE";
+      const rows: HistoryRow[] = [{ message, paragraph: -1, char: 0,
+        text: `${expanded ? "▾" : "▸"} ${kind} · ${time} · ${message.from} → ${message.to}` }];
+      if (!expanded) {
+        rows.push({ message, paragraph: 0, char: 0, text: `  ${truncateToWidth(message.text.replace(/\s+/g, " "), Math.max(1, width - 2))}` });
+      } else {
+        message.text.split("\n").forEach((paragraph, index) => {
+          let cursor = 0;
+          for (const line of wrapTextWithAnsi(paragraph, Math.max(1, width - 2))) {
+            const char = Math.max(cursor, paragraph.indexOf(line, cursor));
+            rows.push({ message, paragraph: index, char, text: `│ ${line}` });
+            cursor = char + line.length;
+          }
+        });
+      }
+      return rows;
+    });
+    // Anchor the source text, not a rendered line number, across reflow and live appends.
+    if (anchor && !this.following) {
+      const index = this.rows.findLastIndex(row => row.message.id === anchor.message.id
+        && row.paragraph === anchor.paragraph && row.char <= anchor.char);
+      if (index >= 0) this.offset = index;
+    }
+    this.width = width;
   }
 
   render(width: number): string[] {
     if (width < 1) return [];
     const height = Math.max(1, this.tui.terminal.rows);
     this.pageSize = Math.max(0, height - 2);
-    if (this.width !== width) {
-      this.width = width;
-      this.lines = this.messages.flatMap(message => {
-        const date = new Date(message.timestamp);
-        const time = Number.isNaN(date.getTime()) ? "--:--" : date.toLocaleString();
-        return [
-          ...wrapTextWithAnsi(this.theme.fg("accent", `${time}  ${message.from} → ${message.to}`), width),
-          ...wrapTextWithAnsi(message.text, width),
-          "",
-        ];
-      });
-      if (!this.lines.length) this.lines = ["No intercom messages in this session yet."];
+    if (this.width !== width) this.reflow(width);
+    if (this.revealSelection) {
+      const index = this.rows.findIndex(row => row.message.id === this.selectedId);
+      if (index >= 0 && (index < this.offset || index >= this.offset + this.pageSize)) this.offset = index;
+      this.revealSelection = false;
     }
-    const maxOffset = Math.max(0, this.lines.length - this.pageSize);
-    this.offset = this.following ? maxOffset : Math.min(this.offset, maxOffset);
+    // While paused, allow blank space below the anchor instead of shifting the content on resize.
+    this.offset = this.following ? Math.max(0, this.rows.length - this.pageSize)
+      : Math.min(this.offset, Math.max(0, this.rows.length - 1));
     const status = this.following ? "LIVE" : this.unseen ? `${this.unseen} new messages · End to follow` : "PAUSED · End to follow";
-    const body = this.lines.slice(this.offset, this.offset + this.pageSize);
+    const body = this.rows.slice(this.offset, this.offset + this.pageSize).map(row => {
+      const selected = row.message.id === this.selectedId;
+      if (row.paragraph === -1) {
+        return this.theme.fg(selected ? "accent" : row.message.response ? "success" : "muted",
+          `${selected ? ">" : " "} ${row.text}`);
+      }
+      return this.theme.fg(selected ? "text" : "dim", row.text);
+    });
+    if (!this.rows.length && this.pageSize) body.push("No intercom messages recorded in this session yet.");
     while (body.length < this.pageSize) body.push("");
     const rows = [
-      this.theme.fg("accent", `INTERCOM · current session · ${this.messages.length} messages · ${status}`),
+      this.theme.fg("accent", `INTERCOM · all branches · ${this.messages.length} recorded messages · ${status}`),
       ...body,
-      this.theme.fg("dim", "↑↓ scroll · PgUp/PgDn page · Home/End · Alt+I/Esc close"),
+      this.theme.fg("dim", "↑↓ select · Tab expand/collapse · PgUp/PgDn scroll · End live · Alt+I/Esc close"),
     ];
     return rows.slice(0, height).map(line => {
       const clipped = truncateToWidth(line, width, "");

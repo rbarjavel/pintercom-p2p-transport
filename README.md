@@ -107,11 +107,13 @@ Environment variables are read when the extension starts. Restart affected Pi se
 
 Press **Alt+I** or run `/intercom-history` to toggle a fullscreen, read-only timeline of this session’s sent and received messages. **Alt+M** still opens the composer.
 
-- **↑/↓**, **PgUp/PgDn**, **Home** browse history; scrolling pauses automatic following.
-- **End** returns to the latest messages and resumes following. New messages are counted while paused.
+- Messages start **collapsed**, with a one-line preview. **↑/↓** selects a message; **Tab** expands/collapses it.
+- **PgUp/PgDn** scroll through expanded content; **Home** selects the first message. Browsing or expanding pauses following, not incoming updates. Resizing preserves the source-text reading position.
+- **End** selects the latest message and resumes following. New messages remain collapsed and are counted while paused.
+- **MESSAGE** and **↳ RESPONSE** labels distinguish ordinary messages from recorded replies; responses also use a distinct color.
 - **Esc** or **Alt+I** closes the view without changing your draft or stopping agents.
 
-History uses existing session records (including other branches and pre-compaction entries), in local recording order. It refreshes every 250 ms while open and works offline with saved history. Incoming messages appear once recorded by Pi. Attachments show names only; exchanges solely between other sessions are not included.
+History uses existing session records (including other branches, inherited fork history, and pre-compaction entries), in local recording order. It refreshes every 250 ms while open and works offline with saved history. LIVE means following recorded messages, not proof of delivery or processing. Incoming messages appear once recorded by Pi; timestamps come from the original message/record and may reflect different clocks. Replies are identified by reply metadata or saved ask-waiter records, never inferred from wording. Attachments show names only; exchanges solely between other sessions are not included.
 
 ## How the P2P Layer Works
 
