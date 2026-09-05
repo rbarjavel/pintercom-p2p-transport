@@ -103,6 +103,16 @@ The shared key and scope are both used to derive the mDNS service name. Peers wi
 
 Environment variables are read when the extension starts. Restart affected Pi sessions after changing them.
 
+## Message History
+
+Press **Alt+I** or run `/intercom-history` to toggle a fullscreen, read-only timeline of this session’s sent and received messages. **Alt+M** still opens the composer.
+
+- **↑/↓**, **PgUp/PgDn**, **Home** browse history; scrolling pauses automatic following.
+- **End** returns to the latest messages and resumes following. New messages are counted while paused.
+- **Esc** or **Alt+I** closes the view without changing your draft or stopping agents.
+
+History uses existing session records (including other branches and pre-compaction entries), in local recording order. It refreshes every 250 ms while open and works offline with saved history. Incoming messages appear once recorded by Pi. Attachments show names only; exchanges solely between other sessions are not included.
+
 ## How the P2P Layer Works
 
 ```mermaid

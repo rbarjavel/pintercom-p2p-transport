@@ -8,6 +8,7 @@ import { IntercomClient, type SendResult } from "./broker/client.ts";
 import type { P2PIntercomClient } from "./p2p/client.ts";
 import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
 import { SessionListOverlay } from "./ui/session-list.ts";
+import { MessageHistoryOverlay } from "./ui/message-history.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
 import { getAskTimeoutMs, loadConfig, type IntercomConfig } from "./config.ts";
@@ -1737,6 +1738,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   });
   
   pi.on("session_shutdown", async () => {
+    closeHistory?.();
     unsubscribeExtensionRegister();
     unsubscribeSubagentControlIntercom();
     unsubscribeSubagentResultIntercom();
@@ -2786,6 +2788,44 @@ Usage:
       notifyIfLive(ctx, `Message sent to ${targetLabel}`, "info", overlayGeneration);
     }
   }
+
+  let closeHistory: (() => void) | undefined;
+  async function toggleHistory(ctx: ExtensionContext): Promise<void> {
+    if (closeHistory) {
+      closeHistory();
+      return;
+    }
+    if (!ctx.hasUI || ("mode" in ctx && ctx.mode !== "tui")) {
+      ctx.ui.notify("Intercom history requires the terminal UI", "warning");
+      return;
+    }
+    let viewer: MessageHistoryOverlay | undefined;
+    try {
+      await ctx.ui.custom<void>((tui, theme, keys, done) => {
+        closeHistory = () => {
+          viewer?.dispose();
+          done();
+        };
+        viewer = new MessageHistoryOverlay(tui, theme, keys, () => ctx.sessionManager.getEntries(), closeHistory);
+        return viewer;
+      }, {
+        overlay: true,
+        overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 },
+      });
+    } finally {
+      viewer?.dispose();
+      closeHistory = undefined;
+    }
+  }
+
+  pi.registerCommand("intercom-history", {
+    description: "Toggle fullscreen intercom message history",
+    handler: async (_args, ctx) => toggleHistory(ctx),
+  });
+  pi.registerShortcut("alt+i", {
+    description: "Toggle fullscreen intercom message history",
+    handler: toggleHistory,
+  });
 
   pi.registerCommand("intercom", {
     description: "Open session intercom overlay",
