@@ -107,7 +107,7 @@ Environment variables are read when the extension starts. Restart affected Pi se
 
 Press **Alt+I** or run `/intercom-history` to toggle a fullscreen, read-only timeline of this session’s sent and received messages. **Alt+M** still opens the composer.
 
-- Messages start **collapsed**, with a one-line preview. **↑/↓** selects a message; **Tab** expands/collapses it.
+- Messages start **collapsed**, with a one-line preview. **↑/↓** selects a message; **Tab** expands/collapses it. For expanded messages, **↑/↓** scrolls through hidden content before selecting the previous/next message.
 - **PgUp/PgDn** scroll through expanded content; **Home** selects the first message. Browsing or expanding pauses following, not incoming updates. Resizing preserves the source-text reading position.
 - **End** selects the latest message and resumes following. New messages remain collapsed and are counted while paused.
 - **MESSAGE** and **↳ RESPONSE** labels distinguish ordinary messages from recorded replies; responses also use a distinct color.

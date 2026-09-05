@@ -130,6 +130,17 @@ export class MessageHistoryOverlay implements Component {
       else if (matchesKey(data, "home")) index = 0;
       else return;
       this.following = false;
+      if (!matchesKey(data, "home") && this.selectedId && this.expanded.has(this.selectedId)) {
+        const first = this.rows.findIndex(row => row.message.id === this.selectedId);
+        const last = this.rows.findLastIndex(row => row.message.id === this.selectedId);
+        const delta = index - selected;
+        if (first >= 0 && ((delta < 0 && this.offset > first)
+          || (delta > 0 && this.offset + this.pageSize <= last))) {
+          this.offset = Math.max(first, Math.min(this.offset + delta, last));
+          this.tui.requestRender();
+          return;
+        }
+      }
       this.selectedId = this.messages[Math.max(0, Math.min(index, this.messages.length - 1))]?.id;
       this.revealSelection = true;
     }
@@ -184,18 +195,15 @@ export class MessageHistoryOverlay implements Component {
     const status = this.following ? "LIVE" : this.unseen ? `${this.unseen} new messages · End to follow` : "PAUSED · End to follow";
     const body = this.rows.slice(this.offset, this.offset + this.pageSize).map(row => {
       const selected = row.message.id === this.selectedId;
-      if (row.paragraph === -1) {
-        return this.theme.fg(selected ? "accent" : row.message.response ? "success" : "muted",
-          `${selected ? ">" : " "} ${row.text}`);
-      }
-      return this.theme.fg(selected ? "text" : "dim", row.text);
+      const content = row.paragraph === -1 ? `${selected ? ">" : " "} ${row.text}` : row.text;
+      return this.theme.fg(row.message.response ? "success" : "accent", content);
     });
     if (!this.rows.length && this.pageSize) body.push("No intercom messages recorded in this session yet.");
     while (body.length < this.pageSize) body.push("");
     const rows = [
       this.theme.fg("accent", `INTERCOM · all branches · ${this.messages.length} recorded messages · ${status}`),
       ...body,
-      this.theme.fg("dim", "↑↓ select · Tab expand/collapse · PgUp/PgDn scroll · End live · Alt+I/Esc close"),
+      this.theme.fg("dim", "↑↓ select/scroll · Tab expand/collapse · PgUp/PgDn scroll · End live · Alt+I/Esc close"),
     ];
     return rows.slice(0, height).map(line => {
       const clipped = truncateToWidth(line, width, "");

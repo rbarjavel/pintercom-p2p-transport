@@ -177,3 +177,66 @@ test("Tab expands only the selection and source text stays anchored on resize", 
     overlay.dispose();
   }
 });
+
+test("arrow keys read overflowing expanded content before selecting another message", () => {
+  const entries = [sent("long", Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n")), sent("next", "next message")];
+  const tui = { terminal: { rows: 8 }, requestRender() {} };
+  const keys = { matches: (data: string, id: string) => matchesKey(data, id.split(".").at(-1) as any) };
+  const overlay = new MessageHistoryOverlay(tui as any, theme as any, keys as any, () => entries as any, () => {});
+  try {
+    overlay.render(120);
+    overlay.handleInput("\x1b[H");
+    overlay.handleInput("\t");
+    const top = overlay.render(120).slice(1, -1);
+    const seen = new Set<number>();
+    for (let i = 0; i < 15; i++) {
+      for (const line of overlay.render(120)) {
+        const match = line.match(/│ line (\d+)/);
+        if (match) seen.add(Number(match[1]));
+      }
+      overlay.handleInput("\x1b[B");
+    }
+    const bottom = overlay.render(120).join("\n");
+    assert.match(bottom, /│ line 19/);
+    assert.doesNotMatch(bottom, /> ▸ MESSAGE/);
+    for (const match of bottom.matchAll(/│ line (\d+)/g)) seen.add(Number(match[1]));
+    assert.equal(seen.size, 20, "every body line is reachable with Down");
+    for (let i = 0; i < 15; i++) {
+      overlay.handleInput("\x1b[A");
+      overlay.render(120);
+    }
+    assert.deepEqual(overlay.render(120).slice(1, -1), top, "Up scrolls back to the expanded header");
+    for (let i = 0; i < 16; i++) {
+      overlay.handleInput("\x1b[B");
+      overlay.render(120);
+    }
+    assert.match(overlay.render(120).join("\n"), /> ▸ MESSAGE[^\n]*\n  next message/);
+  } finally {
+    overlay.dispose();
+  }
+});
+
+test("message and response colors persist through selection and expansion", () => {
+  const entries = [sent("question", "question body"), sent("reply", "reply body")];
+  Object.assign(entries[1].data.message, { replyTo: "question" });
+  const colors: Record<string, string> = { accent: "\x1b[36m", success: "\x1b[32m" };
+  const coloredTheme = { fg: (color: string, value: string) => `${colors[color] ?? ""}${value}\x1b[0m` };
+  const tui = { terminal: { rows: 10 }, requestRender() {} };
+  const keys = { matches: (data: string, id: string) => matchesKey(data, id.split(".").at(-1) as any) };
+  const overlay = new MessageHistoryOverlay(tui as any, coloredTheme as any, keys as any, () => entries as any, () => {});
+  try {
+    for (const key of ["", "\t", "\x1b[A", "\t"]) {
+      if (key) overlay.handleInput(key);
+      const lines = overlay.render(120);
+      for (const line of lines.filter(line => /MESSAGE|question body/.test(line))) {
+        assert.ok(line.startsWith(colors.accent), "messages use accent even when selected");
+      }
+      for (const line of lines.filter(line => /RESPONSE|reply body/.test(line))) {
+        assert.ok(line.startsWith(colors.success), "responses retain their distinct color");
+      }
+      assertLineWidths("colored history", lines, 120);
+    }
+  } finally {
+    overlay.dispose();
+  }
+});
