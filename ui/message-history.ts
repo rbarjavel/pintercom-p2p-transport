@@ -109,6 +109,22 @@ export class MessageHistoryOverlay implements Component {
       return;
     }
     const selected = this.messages.findIndex(message => message.id === this.selectedId);
+    if (this.selectedId && this.expanded.has(this.selectedId) && !matchesKey(data, "tab")) {
+      const first = this.rows.findIndex(row => row.message.id === this.selectedId);
+      const last = this.rows.findLastIndex(row => row.message.id === this.selectedId && row.paragraph !== -2);
+      let offset = this.offset;
+      if (this.keys.matches(data, "tui.select.up") || matchesKey(data, "k")) offset--;
+      else if (this.keys.matches(data, "tui.select.down") || matchesKey(data, "j")) offset++;
+      else if (this.keys.matches(data, "tui.select.pageUp")) offset -= this.pageSize;
+      else if (this.keys.matches(data, "tui.select.pageDown")) offset += this.pageSize;
+      else if (matchesKey(data, "home")) offset = first;
+      else if (matchesKey(data, "end") || matchesKey(data, "shift+g")) offset = last;
+      else return;
+      this.following = false;
+      if (first >= 0) this.offset = Math.max(first, Math.min(offset, Math.max(first, last - this.pageSize + 1)));
+      this.tui.requestRender();
+      return;
+    }
     if (matchesKey(data, "end") || matchesKey(data, "shift+g")) {
       this.following = true;
       this.unseen = 0;
@@ -130,17 +146,6 @@ export class MessageHistoryOverlay implements Component {
       else if (matchesKey(data, "home")) index = 0;
       else return;
       this.following = false;
-      if (!matchesKey(data, "home") && this.selectedId && this.expanded.has(this.selectedId)) {
-        const first = this.rows.findIndex(row => row.message.id === this.selectedId);
-        const last = this.rows.findLastIndex(row => row.message.id === this.selectedId);
-        const delta = index - selected;
-        if (first >= 0 && ((delta < 0 && this.offset > first)
-          || (delta > 0 && this.offset + this.pageSize <= last))) {
-          this.offset = Math.max(first, Math.min(this.offset + delta, last));
-          this.tui.requestRender();
-          return;
-        }
-      }
       this.selectedId = this.messages[Math.max(0, Math.min(index, this.messages.length - 1))]?.id;
       this.revealSelection = true;
     }
@@ -149,7 +154,7 @@ export class MessageHistoryOverlay implements Component {
 
   private reflow(width: number): void {
     const anchor = this.rows[this.offset];
-    this.rows = this.messages.flatMap(message => {
+    this.rows = this.messages.flatMap((message, index) => {
       const date = new Date(message.timestamp);
       const time = Number.isNaN(date.getTime()) ? "--:--" : date.toLocaleString();
       const expanded = this.expanded.has(message.id);
@@ -169,6 +174,7 @@ export class MessageHistoryOverlay implements Component {
           cursor += stripVTControlCharacters(line).replace(/[\s│─┌┐└┘├┤┬┴┼]/g, "").length;
         }
       }
+      if (index < this.messages.length - 1) rows.push({ message, paragraph: -2, char: 0, text: "" });
       return rows;
     });
     // Anchor the source text, not a rendered line number, across reflow and live appends.
@@ -193,7 +199,8 @@ export class MessageHistoryOverlay implements Component {
     // While paused, allow blank space below the anchor instead of shifting the content on resize.
     this.offset = this.following ? Math.max(0, this.rows.length - this.pageSize)
       : Math.min(this.offset, Math.max(0, this.rows.length - 1));
-    const status = this.following ? "LIVE" : this.unseen ? `${this.unseen} new messages · End to follow` : "PAUSED · End to follow";
+    const hint = this.selectedId && this.expanded.has(this.selectedId) ? "Tab to collapse" : "End/G to follow";
+    const status = this.following ? "LIVE" : `${this.unseen ? `${this.unseen} new messages` : "PAUSED"} · ${hint}`;
     const body = this.rows.slice(this.offset, this.offset + this.pageSize).map(row => {
       const selected = row.message.id === this.selectedId;
       const content = row.paragraph === -1 ? `${selected ? ">" : " "} ${row.text}` : row.text;
@@ -205,7 +212,7 @@ export class MessageHistoryOverlay implements Component {
     const rows = [
       this.theme.fg("accent", `INTERCOM · all branches · ${this.messages.length} recorded messages · ${status}`),
       ...body,
-      this.theme.fg("dim", "↑↓/jk select/scroll · Tab toggle · PgUp/PgDn scroll · End/G live · Esc close"),
+      this.theme.fg("dim", "↑↓/jk select/scroll · Tab unlock/toggle · PgUp/PgDn · End/G bottom/live · Esc close"),
     ];
     return rows.slice(0, height).map(line => {
       const clipped = truncateToWidth(line, width, "");

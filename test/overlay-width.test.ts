@@ -175,6 +175,8 @@ test("Tab expands only the selection and source text stays anchored on resize", 
     entries.push(sent("third", "fresh message"));
     await new Promise(resolve => setTimeout(resolve, 300));
     assert.deepEqual(overlay.render(30).slice(1, -1), beforeArrival);
+    overlay.handleInput("\t"); // Collapse before leaving the message
+    overlay.render(30);
     overlay.handleInput("\x1b[F");
     assert.match(overlay.render(120).join("\n"), /LIVE[\s\S]*> ▸ MESSAGE[\s\S]*fresh message/);
   } finally {
@@ -183,8 +185,8 @@ test("Tab expands only the selection and source text stays anchored on resize", 
 });
 
 for (const [up, down, end] of [["\x1b[A", "\x1b[B", "\x1b[F"], ["k", "j", "G"]])
-test(`${down} navigation reads expanded content before selecting another message`, () => {
-  const entries = [sent("long", Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n")), sent("next", "next message")];
+test(`${down === "j" ? "Vim" : "Arrow"} navigation stays locked until collapse`, () => {
+  const entries = [sent("previous", "previous message"), sent("long", Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n")), sent("next", "next message")];
   const tui = { terminal: { rows: 8 }, requestRender() {} };
   const keys = { matches: (data: string, id: string) => matchesKey(data, id.split(".").at(-1) as any) };
   const overlay = new MessageHistoryOverlay(tui as any, theme as any, keys as any, () => entries as any, () => {});
@@ -192,7 +194,18 @@ test(`${down} navigation reads expanded content before selecting another message
     overlay.render(120);
     overlay.handleInput("\x1b[H");
     overlay.handleInput("\t");
+    overlay.handleInput("\t"); // Collapse previous, select long, expand
+    overlay.render(120);
+    overlay.handleInput(down);
+    overlay.render(120);
+    overlay.handleInput("\t");
+    overlay.render(120);
+    overlay.handleInput("\x1b[H");
     const top = overlay.render(120).slice(1, -1);
+    for (const key of [up, up, "\x1b[5~", "\x1b[H"]) {
+      overlay.handleInput(key);
+      assert.deepEqual(overlay.render(120).slice(1, -1), top);
+    }
     const seen = new Set<number>();
     for (let i = 0; i < 15; i++) {
       for (const line of overlay.render(120)) {
@@ -215,6 +228,13 @@ test(`${down} navigation reads expanded content before selecting another message
       overlay.handleInput(down);
       overlay.render(120);
     }
+    for (const key of [down, down, "\x1b[6~", end]) {
+      overlay.handleInput(key);
+      assert.equal(overlay.render(120).join("\n"), bottom, "bottom cannot escape to next message or follow mode");
+    }
+    overlay.handleInput("\t");
+    overlay.render(120);
+    overlay.handleInput(down);
     assert.match(overlay.render(120).join("\n"), /> ▸ MESSAGE[^\n]*\n  next message/);
     overlay.handleInput(end);
     assert.match(overlay.render(120).join("\n"), /LIVE[\s\S]*next message/);
@@ -261,6 +281,11 @@ test("message and response colors persist through selection and expansion", () =
     for (const key of ["", "\t", "\x1b[A", "\t"]) {
       if (key) overlay.handleInput(key);
       const lines = overlay.render(120);
+      if (!key) {
+        const responseIndex = lines.findIndex(line => /RESPONSE/.test(line));
+        assert.ok(responseIndex > 1);
+        assert.equal(stripVTControlCharacters(lines[responseIndex - 1]).trim(), "", "one blank row separates messages");
+      }
       for (const line of lines.filter(line => /MESSAGE/.test(line))) {
         assert.ok(line.startsWith(colors.accent), "messages use accent even when selected");
       }

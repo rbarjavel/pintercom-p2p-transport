@@ -107,9 +107,9 @@ Environment variables are read when the extension starts. Restart affected Pi se
 
 Press **Alt+I** or run `/intercom-history` to toggle a fullscreen, read-only timeline of this session’s sent and received messages. **Alt+M** still opens the composer.
 
-- Messages start **collapsed**, with a one-line preview. **↑/↓** selects a message; **Tab** expands/collapses it. For expanded messages, **↑/↓** scrolls through hidden content before selecting the previous/next message.
-- **PgUp/PgDn** scroll through expanded content; **Home** selects the first message. Browsing or expanding pauses following, not incoming updates. Resizing preserves the source-text reading position.
-- **End** or **G** selects the latest message and resumes following. New messages remain collapsed and are counted while paused.
+- Messages start **collapsed**, with a one-line preview. **↑/↓** selects a message; **Tab** expands/collapses it. Expanded messages lock navigation: **↑/↓**, **j/k**, and paging stop at their boundaries. Collapse with **Tab** before selecting another message.
+- **PgUp/PgDn** scroll through expanded content; **Home** goes to the expanded message’s top (or selects the first message when collapsed). Browsing or expanding pauses following, not incoming updates. Resizing preserves the source-text reading position.
+- **End** or **G** goes to the expanded message’s bottom; when collapsed, it selects the latest message and resumes following. New messages remain collapsed and are counted while paused.
 - Vim aliases **j/k** work alongside **↓/↑** for selection and scrolling; **Tab** still expands/collapses.
 - **MESSAGE** and **↳ RESPONSE** headers use distinct colors. Previews and ordinary body text use the normal text color. Expanded bodies use Pi’s Markdown renderer for headings, lists, tables, links, and syntax-highlighted fenced code.
 - **Esc** or **Alt+I** closes the view without changing your draft or stopping agents.
