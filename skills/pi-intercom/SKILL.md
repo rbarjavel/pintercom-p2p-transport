@@ -274,6 +274,38 @@ if (result.isError && result.content[0].text.includes("Already waiting")) {
 
 ## Best Practices
 
+### Exchange code when discussing code or logic
+
+When discussing implementation, algorithms, control flow, or bugs with another agent, include a fenced pseudocode or real-code block in your message instead of relying on prose alone. Use real code for exact APIs or existing behavior, and pseudocode for proposed logic. Keep snippets focused, identify the relevant file or symbol when known, and clearly label pseudocode so it is not mistaken for runnable code. Code attachments (`type: "snippet"`, with `language`) are also suitable.
+
+Example message:
+
+````text
+Proposed logic for ui/message-history.ts peerName (pseudocode, not runnable):
+
+```text
+hash = SHA256(peer.id)
+color = theme.peerPalette[hash[0] modulo palette.length]
+label = theme.foreground(color, peer.name)
+return bold(label) if hash[1] is odd else label
+```
+
+Please check that the same peer ID and theme produce the same style after reopening.
+````
+
+Example reply:
+
+````text
+Stability check (pseudocode):
+
+```text
+before = peerStyle(peer.id, theme)
+reopen()
+after = peerStyle(peer.id, theme)
+assert before == after
+```
+````
+
 ### Use `ask` for blocking workflows
 
 When the worker needs information to proceed:
