@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { stripVTControlCharacters } from "node:util";
 import { getMarkdownTheme, type ExtensionContext, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
 import { Markdown, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
@@ -65,6 +66,14 @@ export function readHistory(entries: readonly unknown[]): HistoryMessage[] {
   });
 }
 
+// ponytail: theme colors can overlap; ID-derived bold adds variety without dimming text.
+const peerPalette = ["accent", "success", "warning", "mdHeading", "syntaxKeyword", "syntaxFunction", "syntaxString", "syntaxNumber"] as const;
+function peerName(theme: Theme, id: string, name: string): string {
+  const hash = createHash("sha256").update(id).digest();
+  const styled = theme.fg(peerPalette[hash[0] % peerPalette.length], name);
+  return hash[1] % 2 ? theme.bold(styled) : styled;
+}
+
 interface HistoryRow {
   message: HistoryMessage;
   paragraph: number; // -1 is the message header
@@ -76,8 +85,6 @@ export class MessageHistoryOverlay implements Component {
   private messages: HistoryMessage[] = [];
   private rows: HistoryRow[] = [];
   private expanded = new Set<string>();
-  private peerColors = new Map<string, number>();
-  private availableColors = [39, 45, 75, 81, 111, 141, 171, 207, 203, 215, 221, 155];
   private selectedId: string | undefined;
   private revealSelection = false;
   private width = -1;
@@ -106,17 +113,6 @@ export class MessageHistoryOverlay implements Component {
     this.entryCount = entries.length;
     const next = readHistory(entries);
     if (!this.following) this.unseen += Math.max(0, next.length - this.messages.length);
-    for (const message of next) {
-      const name = message.id.startsWith("out:") ? message.to : message.from;
-      let color = this.peerColors.get(message.peerId) ?? this.peerColors.get(name);
-      if (color === undefined) {
-        // ponytail: twelve distinct colors, reuse once the palette is exhausted.
-        if (!this.availableColors.length) this.availableColors = [39, 45, 75, 81, 111, 141, 171, 207, 203, 215, 221, 155];
-        color = this.availableColors.splice(Math.floor(Math.random() * this.availableColors.length), 1)[0];
-      }
-      this.peerColors.set(message.peerId, color);
-      this.peerColors.set(name, color);
-    }
     this.messages = next;
     if (this.following) this.selectedId = next.at(-1)?.id;
     this.invalidate();
@@ -230,7 +226,8 @@ export class MessageHistoryOverlay implements Component {
       if (row.paragraph === -1) {
         const color = row.message.response ? "success" : "accent";
         const outgoing = row.message.id.startsWith("out:");
-        const name = (value: string, local: boolean) => `\x1b[${local ? "97" : `38;5;${this.peerColors.get(row.message.peerId)}`}m${value}\x1b[39m`;
+        const name = (value: string, local: boolean) => local ? this.theme.fg("text", value)
+          : peerName(this.theme, row.message.peerId, value);
         return this.theme.fg(color, content) + name(row.message.from, outgoing)
           + this.theme.fg(color, " → ") + name(row.message.to, !outgoing);
       }

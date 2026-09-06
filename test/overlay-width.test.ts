@@ -243,30 +243,42 @@ test(`${down === "j" ? "Vim" : "Arrow"} navigation stays locked until collapse`,
   }
 });
 
-test("peer name colors are distinct, stable, and shared by short IDs and reply names", async () => {
+test("peer colors are ID-derived across reopening, arrival order, short IDs and reply names", async () => {
   const first = sent("one", "plain body");
   first.data.to = "peer0001";
   const second = sent("two", "another body");
   second.data.to = "peer0002";
-  const entries: unknown[] = [first, second];
+  const reply = { type: "custom_message", customType: "intercom_message", details: {
+    from: { id: "peer0001-full", name: "Alpha" },
+    message: { id: "reply", replyTo: "one", timestamp: 2, content: { text: "response body" } },
+  } };
+  const entries: unknown[] = [first, second, reply];
+  const tokens = ["accent", "success", "warning", "mdHeading", "syntaxKeyword", "syntaxFunction", "syntaxString", "syntaxNumber", "text", "dim"];
+  let paletteOffset = 30;
+  const theme = {
+    fg: (token: string, value: string) => {
+      assert.ok(tokens.includes(token), `uses a theme token: ${token}`);
+      return `\x1b[38;5;${paletteOffset + tokens.indexOf(token)}m${value}\x1b[39m`;
+    },
+    bold: (value: string) => `\x1b[1m${value}\x1b[22m`,
+  };
   const tui = { terminal: { rows: 20 }, requestRender() {} };
   const keys = { matches: (data: string, id: string) => matchesKey(data, id.split(".").at(-1) as any) };
   const overlay = new MessageHistoryOverlay(tui as any, theme as any, keys as any, () => entries as any, () => {});
   const colorOf = (output: string, name: string) => {
-    const match = output.match(new RegExp(`\\x1b\\[38;5;(\\d+)m${name}\\x1b\\[39m`));
+    const match = output.match(new RegExp(`(\\x1b\\[1m)?(\\x1b\\[38;5;\\d+m)${name}\\x1b\\[39m`));
     assert.ok(match, `colored peer name: ${name}`);
-    return match[1];
+    return (match[1] ?? "") + match[2];
   };
   try {
     const before = overlay.render(160).join("\n");
     const firstColor = colorOf(before, "peer0001");
     assert.notEqual(firstColor, colorOf(before, "peer0002"));
-    assert.ok(before.includes("\x1b[97mlocal\x1b[39m"));
-    assert.ok(before.includes("\n  plain body"), "body is not assigned a peer color");
-    entries.push({ type: "custom_message", customType: "intercom_message", details: {
-      from: { id: "peer0001-full", name: "Alpha" },
-      message: { id: "reply", replyTo: "one", timestamp: 2, content: { text: "response body" } },
-    } });
+    assert.ok(before.includes(theme.fg("text", "local")), "local uses theme text, not hardcoded white");
+    assert.ok(before.includes(theme.fg("text", "  plain body")), "body is not assigned a peer color");
+    const third = sent("three");
+    third.data.to = "peer0003";
+    entries.push(third);
     await new Promise(resolve => setTimeout(resolve, 300));
     const after = overlay.render(160).join("\n");
     assert.equal(colorOf(after, "Alpha"), firstColor);
@@ -274,6 +286,22 @@ test("peer name colors are distinct, stable, and shared by short IDs and reply n
     overlay.invalidate();
     assert.equal(colorOf(overlay.render(160).join("\n"), "Alpha"), firstColor);
     assertLineWidths("peer colors", overlay.render(25), 25);
+    for (const history of [entries, [...entries].reverse(), [reply]]) {
+      const reopened = new MessageHistoryOverlay(tui as any, theme as any, keys as any, () => history as any, () => {});
+      try {
+        const output = reopened.render(160).join("\n");
+        assert.equal(colorOf(output, "Alpha"), firstColor, "same ID keeps its color regardless of viewer or history order");
+        if (history.length > 1) assert.equal(colorOf(output, "peer0001"), firstColor);
+      } finally {
+        reopened.dispose();
+      }
+    }
+    paletteOffset = 60; // Simulate an applied theme change.
+    overlay.invalidate();
+    const rethemed = overlay.render(160).join("\n");
+    assert.notEqual(colorOf(rethemed, "Alpha"), firstColor);
+    assert.equal(colorOf(rethemed, "Alpha"), colorOf(rethemed, "peer0001"));
+    assert.equal(colorOf(rethemed, "Alpha").includes("\x1b[1m"), firstColor.includes("\x1b[1m"), "ID-derived emphasis survives theme changes");
   } finally {
     overlay.dispose();
   }
@@ -309,7 +337,7 @@ test("message and response colors persist through selection and expansion", () =
   const entries = [sent("question", "question body"), sent("reply", "reply body")];
   Object.assign(entries[1].data.message, { replyTo: "question" });
   const colors: Record<string, string> = { accent: "\x1b[36m", success: "\x1b[32m", text: "\x1b[37m" };
-  const coloredTheme = { fg: (color: string, value: string) => `${colors[color] ?? ""}${value}\x1b[0m` };
+  const coloredTheme = { ...theme, fg: (color: string, value: string) => `${colors[color] ?? ""}${value}\x1b[0m` };
   const tui = { terminal: { rows: 10 }, requestRender() {} };
   const keys = { matches: (data: string, id: string) => matchesKey(data, id.split(".").at(-1) as any) };
   const overlay = new MessageHistoryOverlay(tui as any, coloredTheme as any, keys as any, () => entries as any, () => {});
