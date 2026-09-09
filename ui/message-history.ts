@@ -123,7 +123,7 @@ export class MessageHistoryOverlay implements Component {
   invalidate(): void { this.width = -1; }
 
   handleInput(data: string): void {
-    if (matchesKey(data, "alt+i") || matchesKey(data, "escape") || this.keys.matches(data, "tui.select.cancel")) {
+    if (matchesKey(data, "alt+i") || matchesKey(data, "super+i") || matchesKey(data, "escape") || this.keys.matches(data, "tui.select.cancel")) {
       this.done();
       return;
     }

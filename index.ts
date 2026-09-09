@@ -2822,10 +2822,12 @@ Usage:
     description: "Toggle fullscreen intercom message history",
     handler: async (_args, ctx) => toggleHistory(ctx),
   });
-  pi.registerShortcut("alt+i", {
-    description: "Toggle fullscreen intercom message history",
-    handler: toggleHistory,
-  });
+  for (const key of ["alt+i", "super+i"] as const) {
+    pi.registerShortcut(key, {
+      description: "Toggle fullscreen intercom message history",
+      handler: toggleHistory,
+    });
+  }
 
   pi.registerCommand("intercom", {
     description: "Open session intercom overlay",
