@@ -138,8 +138,11 @@ test("history follows arrivals, pauses while selecting, resizes and closes", asy
         assertLineWidths("history", lines, width);
       }
     }
-    overlay.handleInput("\x1bi");
-    assert.equal(closed, true);
+    for (const key of ["\x1bi", "\x1b[105;9u", "\x1b"]) { // Alt+I, Cmd+I (Kitty protocol), Esc
+      closed = false;
+      overlay.handleInput(key);
+      assert.equal(closed, true);
+    }
   } finally {
     overlay.dispose();
   }
