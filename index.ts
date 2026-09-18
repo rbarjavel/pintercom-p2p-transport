@@ -37,6 +37,7 @@ import { fileURLToPath } from "node:url";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
 import { openProjectPane, resolveTargetInCwd, waitForProjectSession, type ProjectPaneLaunch } from "./project-agent.ts";
+import { IntercomWebServer, type WebServerInfo } from "./web/server.ts";
 
 type ActiveIntercomClient = IntercomClient | P2PIntercomClient;
 type OutgoingMessageOptions = Parameters<IntercomClient["send"]>[1];
@@ -619,6 +620,7 @@ function getNamePollMs(): number {
 }
 export default function piIntercomExtension(pi: ExtensionAPI) {
   let client: ActiveIntercomClient | null = null;
+  let webServer: IntercomWebServer | null = null;
   const config: IntercomConfig = loadConfig();
   const askTimeoutMs = getAskTimeoutMs();
   const localExtensions = new Map<string, {
@@ -1778,6 +1780,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     replyTracker.reset();
     agentRunning = false;
     activeTools.clear();
+    if (webServer) {
+      await webServer.stop().catch(() => {});
+      webServer = null;
+    }
     if (client) {
       await client.disconnect();
       client = null;
@@ -2866,6 +2872,73 @@ Usage:
   pi.registerCommand("intercom-id", {
     description: "Insert a stable pi-intercom handoff snippet for this session into the editor",
     handler: async (_args, ctx) => insertIntercomId(ctx),
+  });
+
+  async function handleWebServerCommand(args: string, ctx: ExtensionContext): Promise<void> {
+    const trimmed = args.trim();
+    if (trimmed.toLowerCase() === "stop") {
+      if (!webServer || !webServer.isRunning()) {
+        ctx.ui.notify("Intercom web server is not running", "info");
+        return;
+      }
+      await webServer.stop();
+      webServer = null;
+      ctx.ui.notify("Intercom web server stopped", "info");
+      return;
+    }
+
+    if (trimmed.toLowerCase() === "status") {
+      if (!webServer || !webServer.isRunning()) {
+        ctx.ui.notify("Intercom web server is stopped. Start it with /intercom-web", "info");
+        return;
+      }
+      const info = webServer.getServerInfo()!;
+      const lanList = info.lanUrls.length ? `\nLAN: ${info.lanUrls.join(", ")}` : "";
+      ctx.ui.notify(`Intercom Web UI running on ${info.localUrl}${lanList}`, "info");
+      return;
+    }
+
+    if (webServer && webServer.isRunning()) {
+      const info = webServer.getServerInfo()!;
+      const lanList = info.lanUrls.length ? `\nLAN: ${info.lanUrls.join(", ")}` : "";
+      ctx.ui.notify(`Intercom Web UI already running on ${info.localUrl}${lanList}\nUse '/intercom-web stop' to stop it.`, "info");
+      return;
+    }
+
+    let port = 4737;
+    if (trimmed && !isNaN(Number(trimmed))) {
+      port = Number(trimmed);
+    }
+
+    try {
+      const connectedClient = await ensureConnected("overlay");
+      webServer = new IntercomWebServer({
+        port,
+        provider: connectedClient,
+      });
+      const info = await webServer.start();
+      const lanMsg = info.lanUrls.length
+        ? `\n📱 Smartphone (Wi-Fi):\n${info.lanUrls.map((u) => `  👉 ${u}`).join("\n")}`
+        : "";
+      ctx.ui.notify(`📡 Intercom Web UI lancé !\n💻 Local: ${info.localUrl}${lanMsg}`, "info");
+    } catch (err: any) {
+      ctx.ui.notify(`Failed to start Intercom Web UI: ${err.message || String(err)}`, "error");
+    }
+  }
+
+  pi.registerCommand("intercom-web", {
+    description: "Start, stop, or inspect the Intercom mobile-friendly web dashboard",
+    handler: async (args, ctx) => handleWebServerCommand(args, ctx),
+  });
+
+  pi.registerCommand("intercom-start-web-ui", {
+    description: "Launch the Intercom local web dashboard for mobile monitoring",
+    handler: async (args, ctx) => handleWebServerCommand(args, ctx),
+  });
+
+  pi.registerCommand("intercom-stop-web-ui", {
+    description: "Stop the Intercom web dashboard server",
+    handler: async (_args, ctx) => handleWebServerCommand("stop", ctx),
   });
 
   pi.registerShortcut("alt+m", {

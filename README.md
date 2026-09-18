@@ -119,6 +119,31 @@ Press **Alt+I** or **Cmd+I** (macOS terminals that forward Command via the Kitty
 
 History uses existing session records (including other branches, inherited fork history, and pre-compaction entries), in local recording order. It refreshes every 250 ms while open and works offline with saved history. LIVE means following recorded messages, not proof of delivery or processing. Incoming messages appear once recorded by Pi; timestamps come from the original message/record and may reflect different clocks. Replies are identified by reply metadata or saved ask-waiter records, never inferred from wording. Attachments show names only; exchanges solely between other sessions are not included.
 
+## Web Monitoring Dashboard (Mobile / LAN)
+
+Monitor all active Pi agents across your local network in real-time from your smartphone or browser:
+
+```bash
+# In any Pi session with intercom:
+/intercom-web
+# or
+/intercom-start-web-ui [port]
+```
+
+To stop the web server:
+```bash
+/intercom-web stop
+# or
+/intercom-stop-web-ui
+```
+
+Features:
+- **Mobile-friendly UI**: Modern responsive interface displaying every agent discovered on the LAN.
+- **Live SSE updates**: Real-time status badge transitions (`🟢 IDLE`, `🧠 THINKING`, `⚙️ TOOL:<NAME>`), token context usage gauges, and relative activity times.
+- **Browser Push Notifications**: Optional notifications and gentle audio alerts on your mobile device when an agent finishes thinking or begins a tool execution.
+- **Search & Filter**: Instantly filter agents by name, hostname, working directory, model, or status.
+
+
 ## How the P2P Layer Works
 
 ```mermaid
