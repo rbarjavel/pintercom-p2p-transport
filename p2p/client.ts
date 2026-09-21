@@ -376,13 +376,14 @@ export class P2PIntercomClient extends EventEmitter {
     void this.request(peerId, { type: "receipt", scopeId: this.scopeId, from: this.registration, receipt }).catch(() => undefined);
   }
 
-  updatePresence(updates: { name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null }): void {
+  updatePresence(updates: { name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null; activeToolDetail?: string | null; lastToolDetail?: string | null }): void {
     if (!this.registration) return;
     for (const [key, value] of Object.entries(updates)) {
       if (value === null) delete (this.registration as unknown as Record<string, unknown>)[key];
       else if (value !== undefined) (this.registration as unknown as Record<string, unknown>)[key] = value;
     }
     this.registration.lastActivity = Date.now();
+    this.emit("presence_update", this.registration);
     for (const { peerId } of this.peers.values()) {
       void this.request(peerId, { type: "presence", scopeId: this.scopeId, from: this.registration }).catch(() => undefined);
     }

@@ -120,6 +120,33 @@ Press **Alt+I** or **Cmd+I** (macOS terminals that forward Command via the Kitty
 
 History uses existing session records (including other branches, inherited fork history, and pre-compaction entries), in local recording order. It refreshes every 250 ms while open and works offline with saved history. LIVE means following recorded messages, not proof of delivery or processing. Incoming messages appear once recorded by Pi; timestamps come from the original message/record and may reflect different clocks. Replies are identified by reply metadata or saved ask-waiter records, never inferred from wording. Collapsed messages show attachment counts and names. Expand with **Tab** to inspect attachment type, language, text size, and recorded contents. File transfers show source paths on the sender and saved locations/file listings on the recipient; evidence attachments show the local evidence ID, reported provenance, coverage and exact excerpt. Sent transfers now retain their attachment details too. Older sent records without transfer metadata cannot reconstruct those details. The view reads saved records only—it does not open transferred files or rerun tools, and recorded paths may no longer exist. Exchanges solely between other sessions are not included.
 
+## Web Monitoring Dashboard (Mobile / LAN)
+
+Monitor all active Pi agents across your local network in real-time from your smartphone or browser:
+
+```bash
+# In any Pi session with intercom:
+/intercom-web
+# or
+/intercom-start-web-ui [port]
+```
+
+To stop the web server:
+```bash
+/intercom-web stop
+# or
+/intercom-stop-web-ui
+```
+
+Features:
+- **Mobile-friendly UI**: Modern, minimalist dark interface displaying every agent discovered on the LAN.
+- **Expandable Agent Cards**: Tap any agent card to inspect the active running command (e.g. bash commands, file paths, tool queries) or the last executed action, with one-tap copy.
+- **Live SSE updates**: Real-time status transitions (`idle`, `thinking`, `tool: <name>`), token context usage gauges, and relative activity times.
+- **Quick Actions**: One-tap copy for `/intercom to:<agent>` handoff, full working directory path, PID, and tmux pane details.
+- **Browser Push Notifications**: Optional web notifications with gentle audio chimes on mobile when an agent finishes thinking or begins running a tool.
+- **Search & Filter**: Instantly filter agents by name, hostname, working directory, model, status, or executed command.
+
+
 ## How the P2P Layer Works
 
 ```mermaid

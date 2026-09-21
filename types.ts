@@ -45,6 +45,10 @@ export interface SessionInfo {
    *  name, which is mutable — so a peer can live-resolve the current window
    *  from it via tmux when it needs to introspect or drive that pane. */
   tmuxPane?: string;
+  /** Details of the currently running command or tool execution. */
+  activeToolDetail?: string;
+  /** Details of the last completed tool execution. */
+  lastToolDetail?: string;
 }
 
 export interface Message {
@@ -117,7 +121,7 @@ export type ClientMessage =
   | { type: "message_receipt"; receipt: MessageReceipt }
   | { type: "cancel_message"; messageId: string }
   | { type: "cancel_ask"; messageId: string }
-  | { type: "presence"; name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null }
+  | { type: "presence"; name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null; activeToolDetail?: string | null; lastToolDetail?: string | null }
   | {
       type: "extension_publish";
       namespace: string;

@@ -954,6 +954,26 @@ class IntercomBroker {
               changed = true;
             }
           }
+          if (clientMessage.activeToolDetail !== undefined) {
+            if (clientMessage.activeToolDetail === null) {
+              if (session.info.activeToolDetail !== undefined) { delete session.info.activeToolDetail; changed = true; }
+            } else if (typeof clientMessage.activeToolDetail !== "string") {
+              throw new Error("Invalid presence activeToolDetail");
+            } else if (session.info.activeToolDetail !== clientMessage.activeToolDetail) {
+              session.info.activeToolDetail = clientMessage.activeToolDetail;
+              changed = true;
+            }
+          }
+          if (clientMessage.lastToolDetail !== undefined) {
+            if (clientMessage.lastToolDetail === null) {
+              if (session.info.lastToolDetail !== undefined) { delete session.info.lastToolDetail; changed = true; }
+            } else if (typeof clientMessage.lastToolDetail !== "string") {
+              throw new Error("Invalid presence lastToolDetail");
+            } else if (session.info.lastToolDetail !== clientMessage.lastToolDetail) {
+              session.info.lastToolDetail = clientMessage.lastToolDetail;
+              changed = true;
+            }
+          }
           const now = Date.now();
           session.info.lastActivity = now;
           if (changed || now - session.lastPresenceBroadcastAt >= PRESENCE_HEARTBEAT_MS) {

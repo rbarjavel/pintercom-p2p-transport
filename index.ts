@@ -39,6 +39,7 @@ import { fileURLToPath } from "node:url";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
 import { openProjectPane, resolveTargetInCwd, waitForProjectSession, type ProjectPaneLaunch } from "./project-agent.ts";
+import { IntercomWebServer, type WebServerInfo } from "./web/server.ts";
 
 type ActiveIntercomClient = IntercomClient | P2PIntercomClient;
 type OutgoingMessageOptions = Parameters<IntercomClient["send"]>[1];
@@ -634,6 +635,7 @@ function getNamePollMs(): number {
 }
 export default function piIntercomExtension(pi: ExtensionAPI) {
   let client: ActiveIntercomClient | null = null;
+  let webServer: IntercomWebServer | null = null;
   const config: IntercomConfig = loadConfig();
   const askTimeoutMs = getAskTimeoutMs();
   const localExtensions = new Map<string, {
@@ -662,6 +664,35 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let runtimeGeneration = 0;
   let agentRunning = false;
   const activeTools = new Map<string, string>();
+  let currentActiveToolDetail: string | null = null;
+  let lastCompletedToolDetail: string | null = null;
+
+  function formatToolCallDetail(toolName: string, args: unknown): string {
+    if (!args || typeof args !== "object") return toolName;
+    const record = args as Record<string, unknown>;
+    if (toolName === "bash" && typeof record.command === "string") {
+      return record.command.trim();
+    }
+    if ((toolName === "read" || toolName === "write" || toolName === "edit") && typeof record.path === "string") {
+      return `${toolName} ${record.path.trim()}`;
+    }
+    if ((toolName === "ffgrep" || toolName === "fffind") && typeof record.pattern === "string") {
+      return `${toolName} "${record.pattern.trim()}"`;
+    }
+    if (toolName === "intercom" && typeof record.action === "string") {
+      return `intercom ${record.action}${record.to ? ` -> ${record.to}` : ""}`;
+    }
+    if (typeof record.command === "string") {
+      return record.command.trim();
+    }
+    if (typeof record.query === "string") {
+      return `${toolName} "${record.query.trim()}"`;
+    }
+    if (typeof record.path === "string") {
+      return `${toolName} ${record.path.trim()}`;
+    }
+    return toolName;
+  }
   let intercomToolHiddenByPolicy = false;
   const replyTracker = new ReplyTracker();
   function hideIntercomTool(): void {
@@ -1011,7 +1042,15 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return;
     }
     // context% rides the status heartbeat so peers see live usage at turn boundaries.
-    client.updatePresence({ status: currentStatus(), ...currentContextUsage() });
+    client.updatePresence({
+      status: currentStatus(),
+      activeToolDetail: currentActiveToolDetail,
+      lastToolDetail: lastCompletedToolDetail,
+      ...currentContextUsage(),
+    });
+    if (webServer && webServer.isRunning()) {
+      webServer.broadcastSessions().catch(() => {});
+    }
   }
   function currentSessionTargetMatches(to: string, resolvedTo?: string | null, activeClient?: ActiveIntercomClient): boolean {
     const targets = new Set<string>();
@@ -1793,6 +1832,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     replyTracker.reset();
     agentRunning = false;
     activeTools.clear();
+    currentActiveToolDetail = null;
+    lastCompletedToolDetail = null;
+    if (webServer) {
+      await webServer.stop().catch(() => {});
+      webServer = null;
+    }
     if (client) {
       await client.disconnect();
       client = null;
@@ -1816,11 +1861,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     activeTools.clear();
     syncPresenceStatus();
   });
-  pi.on("tool_execution_start", (event) => {
+  pi.on("tool_execution_start", (event: any) => {
     if (!getLiveContext()) {
       return;
     }
     activeTools.set(event.toolCallId, event.toolName);
+    currentActiveToolDetail = formatToolCallDetail(event.toolName, event.args);
     syncPresenceStatus();
   });
   pi.on("tool_execution_end", (event) => {
@@ -1828,6 +1874,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return;
     }
     activeTools.delete(event.toolCallId);
+    if (activeTools.size === 0) {
+      if (currentActiveToolDetail) {
+        lastCompletedToolDetail = currentActiveToolDetail;
+      }
+      currentActiveToolDetail = null;
+    }
     syncPresenceStatus();
   });
   pi.on("agent_end", () => {
@@ -1836,6 +1888,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     agentRunning = false;
     activeTools.clear();
+    currentActiveToolDetail = null;
     syncPresenceStatus();
   });
   pi.on("turn_start", (_event, ctx) => {
@@ -2887,6 +2940,73 @@ Usage:
   pi.registerCommand("intercom-id", {
     description: "Insert a stable pi-intercom handoff snippet for this session into the editor",
     handler: async (_args, ctx) => insertIntercomId(ctx),
+  });
+
+  async function handleWebServerCommand(args: string, ctx: ExtensionContext): Promise<void> {
+    const trimmed = args.trim();
+    if (trimmed.toLowerCase() === "stop") {
+      if (!webServer || !webServer.isRunning()) {
+        ctx.ui.notify("Intercom web server is not running", "info");
+        return;
+      }
+      await webServer.stop();
+      webServer = null;
+      ctx.ui.notify("Intercom web server stopped", "info");
+      return;
+    }
+
+    if (trimmed.toLowerCase() === "status") {
+      if (!webServer || !webServer.isRunning()) {
+        ctx.ui.notify("Intercom web server is stopped. Start it with /intercom-web", "info");
+        return;
+      }
+      const info = webServer.getServerInfo()!;
+      const lanList = info.lanUrls.length ? `\nLAN: ${info.lanUrls.join(", ")}` : "";
+      ctx.ui.notify(`Intercom Web UI running on ${info.localUrl}${lanList}`, "info");
+      return;
+    }
+
+    if (webServer && webServer.isRunning()) {
+      const info = webServer.getServerInfo()!;
+      const lanList = info.lanUrls.length ? `\nLAN: ${info.lanUrls.join(", ")}` : "";
+      ctx.ui.notify(`Intercom Web UI already running on ${info.localUrl}${lanList}\nUse '/intercom-web stop' to stop it.`, "info");
+      return;
+    }
+
+    let port = 4737;
+    if (trimmed && !isNaN(Number(trimmed))) {
+      port = Number(trimmed);
+    }
+
+    try {
+      const connectedClient = await ensureConnected("overlay");
+      webServer = new IntercomWebServer({
+        port,
+        provider: connectedClient,
+      });
+      const info = await webServer.start();
+      const lanMsg = info.lanUrls.length
+        ? `\n📱 Smartphone (Wi-Fi):\n${info.lanUrls.map((u) => `  👉 ${u}`).join("\n")}`
+        : "";
+      ctx.ui.notify(`📡 Intercom Web UI lancé !\n💻 Local: ${info.localUrl}${lanMsg}`, "info");
+    } catch (err: any) {
+      ctx.ui.notify(`Failed to start Intercom Web UI: ${err.message || String(err)}`, "error");
+    }
+  }
+
+  pi.registerCommand("intercom-web", {
+    description: "Start, stop, or inspect the Intercom mobile-friendly web dashboard",
+    handler: async (args, ctx) => handleWebServerCommand(args, ctx),
+  });
+
+  pi.registerCommand("intercom-start-web-ui", {
+    description: "Launch the Intercom local web dashboard for mobile monitoring",
+    handler: async (args, ctx) => handleWebServerCommand(args, ctx),
+  });
+
+  pi.registerCommand("intercom-stop-web-ui", {
+    description: "Stop the Intercom web dashboard server",
+    handler: async (_args, ctx) => handleWebServerCommand("stop", ctx),
   });
 
   pi.registerShortcut("alt+m", {
