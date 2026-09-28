@@ -30,6 +30,13 @@ test("viewer serves local HTML, bounded snapshot and live interaction updates", 
     assert.match(page.headers.get("content-type") ?? "", /text\/html/);
     const html = await page.text();
     assert.match(html, /P2P agent board/);
+    assert.match(html, /--bg: #000000; --panel: #0a0a0a/);
+    assert.match(html, /--border-focus: #38bdf8/);
+    assert.match(html, /\.edge path\.visible \{ stroke:var\(--text-muted\)/);
+    assert.match(html, /\.agent\.working \{ border-color:var\(--green\)/);
+    assert.match(html, /\.edge\.sending path\.visible \{ stroke:var\(--orange\)/);
+    assert.match(html, /prefers-reduced-motion:reduce/);
+    assert.match(html, /stream\.addEventListener\('presence'/);
     assert.match(html, /overflow-wrap:anywhere/);
     assert.match(html, /id="window-layer"/);
     assert.match(html, /id="zoom-in"/);
@@ -53,6 +60,21 @@ test("viewer serves local HTML, bounded snapshot and live interaction updates", 
     assert.equal(keys.pairKey(a, b), keys.pairKey(b, a));
     assert.equal(keys.pairMembers("broken").length, 0);
     assert.equal(keys.pairMembers(keys.pairKey(a, a)).length, 2);
+    const animationFn = browserScript.slice(browserScript.indexOf("function animateConnection("), browserScript.indexOf("function reconcile("));
+    const classes = new Set<string>();
+    const edge = { classList: { add: (name: string) => classes.add(name), remove: (name: string) => classes.delete(name) }, getBoundingClientRect: () => ({}) };
+    let endPulse = () => {};
+    const animate = new Script(`${pairFns}\n${animationFn}\nanimateConnection`).runInNewContext({
+      lines: new Map([[keys.pairKey(a, b), edge]]), clearTimeout: () => {},
+      setTimeout: (callback: () => void, duration: number) => { assert.equal(duration, 1800); endPulse = callback; return 1; },
+    }) as (item: { action: string; from: { id: string; epoch: string }; to: { id: string; epoch: string } }) => void;
+    const from = { id: "agent", epoch: "one" }, to = { id: "other", epoch: "one" };
+    animate({ action: "receipt", from, to });
+    assert.equal(classes.has("sending"), false);
+    animate({ action: "send", from, to });
+    assert.equal(classes.has("sending"), true);
+    endPulse();
+    assert.equal(classes.has("sending"), false);
     const zoomFns = browserScript.slice(browserScript.indexOf("function setZoom("), browserScript.indexOf("function fit("));
     const zoomState = new Script(`let x=60,y=60,zoom=1; const board={clientWidth:800,clientHeight:600}; function camera() {} ${zoomFns} setZoom(2,300,250); ({x,y,zoom})`).runInNewContext({ Math });
     assert.deepEqual([zoomState.x, zoomState.y, zoomState.zoom], [-180,-130,2]);
@@ -123,7 +145,41 @@ test("viewer serves local HTML, bounded snapshot and live interaction updates", 
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   }
   assert.equal(observer.listenerCount("event"), 0);
+  assert.equal(observer.listenerCount("presence"), 0);
   assert.equal(observer.listenerCount("status"), 0);
+});
+
+test("viewer snapshots current agent activity and clears disconnected reporters", async () => {
+  const observer = new EventEmitter();
+  const server = createViewerServer(observer);
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const controller = new AbortController();
+  const reporter = { id: "remote", epoch: "new", name: "Remote", peerId: "remote-peer" };
+  try {
+    observer.emit("status", { connected: true, reporter });
+    observer.emit("presence", { reporter, active: true });
+    const response = await fetch(`http://127.0.0.1:${address.port}/events`, { signal: controller.signal });
+    const reader = response.body!.getReader();
+    let buffer = "";
+    while (!buffer.includes("\n\n")) {
+      const chunk = await reader.read();
+      assert.equal(chunk.done, false);
+      buffer += new TextDecoder().decode(chunk.value);
+    }
+    const snapshot = JSON.parse(buffer.match(/^data: (.*)$/m)?.[1] ?? "null");
+    assert.deepEqual(snapshot.presence, [{ peer: { id: "remote", epoch: "new", name: "Remote" }, active: true }]);
+    observer.emit("status", { connected: false, peerId: "remote-peer" });
+    let next = buffer.slice(buffer.indexOf("\n\n") + 2);
+    while (!next.includes("\n\n")) { const chunk = await reader.read(); assert.equal(chunk.done, false); next += new TextDecoder().decode(chunk.value); }
+    assert.match(next, /^event: presence/m);
+    assert.match(next, /"connected":false/);
+  } finally {
+    controller.abort();
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
 });
 
 test("large shared-text histories yield bounded reconnect snapshots", async () => {

@@ -18,6 +18,7 @@ export const MAX_TELEMETRY_BODY_BYTES = 16 * 1024;
 const text = new TextEncoder();
 const decode = new TextDecoder();
 export type Endpoint = { id: string; epoch: string; name?: string };
+export type TelemetryPresence = { reporter: Endpoint & { peerId: string }; active: boolean };
 export type TelemetryEvent = {
   version: 1; reporter: Endpoint & { peerId: string }; eventId: string; sequence: number;
   messageId: string; from: Endpoint; to: Endpoint;
@@ -111,11 +112,12 @@ export function projectMessage(message: Message, from: Endpoint, to: Endpoint, s
 export class AgentTelemetry {
   private readonly key = telemetryKey();
   private readonly scope = getIntercomScopeId();
-  private observers = new Map<string, { stream: Stream; queue: TelemetryEvent[]; writing: boolean }>();
+  private observers = new Map<string, { stream: Stream; queue: (TelemetryEvent | (TelemetryPresence & { type: "presence" }))[]; writing: boolean }>();
   private pending = new Set<string>();
   private retries = new Map<string, { attempts: number; lastSeen: number; timer?: NodeJS.Timeout }>();
   private sequence = 0;
   private dropped = 0;
+  private lastActive: boolean | undefined;
   private closed = false;
   constructor(private node: Libp2p, private session: SessionInfo) {}
   /** Accept a viewer that dialed this agent through the regular P2P discovery service. */
@@ -128,8 +130,9 @@ export class AgentTelemetry {
       await writeFrame(frame, sign(this.key, { type: "subscribed", scope: this.scope, reporter: { ...endpoint(this.session), peerId: this.node.peerId.toString() } }));
       const id = peerId.toString();
       if (this.closed || this.observers.has(id) || this.observers.size >= 32) throw new Error("Duplicate or excess observer");
-      const observer = { stream, queue: [] as TelemetryEvent[], writing: false };
+      const observer = { stream, queue: [] as (TelemetryEvent | (TelemetryPresence & { type: "presence" }))[], writing: false };
       this.observers.set(id, observer);
+      this.emitPresence(true, observer);
       stream.addEventListener("close", () => { if (this.observers.get(id) === observer) this.observers.delete(id); });
     } catch { stream.abort(new Error("Telemetry subscription rejected")); }
   }
@@ -155,8 +158,9 @@ export class AgentTelemetry {
       if (this.closed) { stream.abort(new Error("Telemetry stopped")); return; }
       retry.attempts = 0;
       if (this.observers.has(id)) { stream.abort(new Error("Already subscribed")); return; }
-      const observer = { stream, queue: [] as TelemetryEvent[], writing: false };
+      const observer = { stream, queue: [] as (TelemetryEvent | (TelemetryPresence & { type: "presence" }))[], writing: false };
       this.observers.set(id, observer);
+      this.emitPresence(true, observer);
       stream.addEventListener("close", () => { if (this.observers.get(id) === observer) { this.observers.delete(id); this.retry(peerId); } });
     } catch { this.retry(peerId); }
     finally { this.pending.delete(id); }
@@ -169,6 +173,17 @@ export class AgentTelemetry {
       void this.connectPeer(peerId).catch(() => undefined);
     }, Math.min(30_000, 1_000 * 2 ** Math.min(retry.attempts++, 5)));
     retry.timer.unref();
+  }
+  emitPresence(force = false, only?: { stream: Stream; queue: (TelemetryEvent | (TelemetryPresence & { type: "presence" }))[]; writing: boolean }): void {
+    const active = this.session.status?.startsWith("thinking") === true || this.session.status?.startsWith("tool:") === true;
+    if (!force && this.lastActive === active) return;
+    this.lastActive = active;
+    const presence: TelemetryPresence & { type: "presence" } = { type: "presence", reporter: { ...endpoint(this.session), peerId: this.node.peerId.toString() }, active };
+    for (const observer of only ? [only] : this.observers.values()) {
+      if (observer.queue.length >= 128) observer.queue.shift();
+      observer.queue.push(presence);
+      void this.flush(observer);
+    }
   }
   emit(event: Omit<TelemetryEvent, "version" | "reporter" | "eventId" | "sequence">): void {
     if (this.closed || !this.observers.size) return;
@@ -186,14 +201,16 @@ export class AgentTelemetry {
       void this.flush(observer);
     }
   }
-  private async flush(observer: { stream: Stream; queue: TelemetryEvent[]; writing: boolean }): Promise<void> {
+  private async flush(observer: { stream: Stream; queue: (TelemetryEvent | (TelemetryPresence & { type: "presence" }))[]; writing: boolean }): Promise<void> {
     if (observer.writing) return;
     observer.writing = true;
     try {
       const frame = framed(observer.stream);
       while (observer.queue.length && !this.closed) {
         const event = observer.queue.shift()!;
-        await writeFrame(frame, sign(this.key, { type: "event", scope: this.scope, event, dropped: this.dropped }));
+        await writeFrame(frame, sign(this.key, "type" in event
+          ? { type: "presence", scope: this.scope, presence: { reporter: event.reporter, active: event.active } }
+          : { type: "event", scope: this.scope, event, dropped: this.dropped }));
       }
     } catch { observer.stream.abort(new Error("Telemetry stream failed")); }
     finally { observer.writing = false; }
@@ -257,7 +274,7 @@ export class TelemetryObserver extends EventEmitter {
       await writeFrame(frame, sign(this.key, { type: "subscribe", version: 1, scope: this.scope, observerPeerId: node.peerId.toString() }));
       const response = verify(this.key, await readFrame(frame, AbortSignal.timeout(5_000))) as { type?: string; scope?: string; reporter?: Endpoint & { peerId?: string } };
       if (response.type !== "subscribed" || response.scope !== this.scope || !validEndpoint(response.reporter) || response.reporter?.peerId !== id) throw new Error("Invalid agent subscription");
-      await this.consume(stream, peerId, response.reporter as Endpoint & { peerId: string });
+      await this.consume(frame, stream, peerId, response.reporter as Endpoint & { peerId: string });
     } catch { stream?.abort(new Error("Telemetry connection failed")); }
     finally { this.connecting.delete(id); }
   }
@@ -267,18 +284,23 @@ export class TelemetryObserver extends EventEmitter {
       const hello = verify(this.key, await readFrame(frame, AbortSignal.timeout(5_000))) as { type?: string; version?: number; scope?: string; reporter?: Endpoint & { peerId?: string } };
       if (hello.type !== "subscribe" || hello.version !== 1 || hello.scope !== this.scope || !validEndpoint(hello.reporter) || hello.reporter?.peerId !== peerId.toString()) throw new Error("Invalid telemetry subscription");
       await writeFrame(frame, sign(this.key, { type: "subscribed", scope: this.scope }));
-      await this.consume(stream, peerId, hello.reporter as Endpoint & { peerId: string });
+      await this.consume(frame, stream, peerId, hello.reporter as Endpoint & { peerId: string });
     } catch { stream.abort(new Error("Telemetry subscription rejected")); }
   }
-  private async consume(stream: Stream, peerId: PeerId, reporter: Endpoint & { peerId: string }): Promise<void> {
+  private async consume(frame: ReturnType<typeof framed>, stream: Stream, peerId: PeerId, reporter: Endpoint & { peerId: string }): Promise<void> {
     const id = peerId.toString();
     if (this.active.has(id) || this.active.size >= 64) { stream.abort(new Error("Duplicate telemetry connection")); return; }
     this.active.add(id);
     this.emit("status", { connected: true, reporter });
     try {
-      const frame = framed(stream);
       for (;;) {
-        const payload = verify(this.key, await readFrame(frame)) as { type?: string; scope?: string; event?: unknown; dropped?: number };
+        const payload = verify(this.key, await readFrame(frame)) as { type?: string; scope?: string; event?: unknown; presence?: TelemetryPresence; dropped?: number };
+        if (payload.type === "presence") {
+          const presence = payload.presence;
+          if (payload.scope !== this.scope || !presence || !onlyKeys(presence, ["reporter", "active"]) || !validEndpoint(presence.reporter) || presence.reporter.peerId !== reporter.peerId || presence.reporter.id !== reporter.id || presence.reporter.epoch !== reporter.epoch || typeof presence.active !== "boolean") throw new Error("Invalid telemetry presence");
+          this.emit("presence", presence);
+          continue;
+        }
         if (payload.type !== "event" || payload.scope !== this.scope || !validTelemetryEvent(payload.event, reporter) || !Number.isSafeInteger(payload.dropped) || payload.dropped! < 0) throw new Error("Invalid telemetry event");
         this.emit("event", payload.event);
         if (payload.dropped) this.emit("status", { partial: true, dropped: payload.dropped });

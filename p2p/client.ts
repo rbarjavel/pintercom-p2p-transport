@@ -429,6 +429,7 @@ export class P2PIntercomClient extends EventEmitter {
     }
     this.registration.lastActivity = Date.now();
     this.emit("presence_update", this.registration);
+    this.telemetry?.emitPresence();
     for (const { peerId } of this.peers.values()) {
       void this.request(peerId, { type: "presence", scopeId: this.scopeId, from: this.registration }).catch(() => undefined);
     }

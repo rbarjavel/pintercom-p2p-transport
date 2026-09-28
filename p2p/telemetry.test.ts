@@ -75,7 +75,9 @@ test("observer rejects wrong key, scope, oversized frames and unrelated reports"
   Reflect.set(AgentTelemetry.prototype, "connectPeer", async () => undefined);
   const agent = new P2PIntercomClient();
   const seen: unknown[] = [];
+  const activities: unknown[] = [];
   observer.on("event", (event) => seen.push(event));
+  observer.on("presence", (activity) => activities.push(activity));
   const signed = (payload: unknown, secret = key) => ({ payload, mac: createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex") });
   try {
     await observer.start();
@@ -107,6 +109,12 @@ test("observer rejects wrong key, scope, oversized frames and unrelated reports"
     await new Promise((resolve) => setTimeout(resolve, 70));
     assert.deepEqual(seen, []);
     good.stream.abort(new Error("test done"));
+    const forged = await send(hello);
+    await forged.frame.read();
+    await forged.frame.write(new TextEncoder().encode(JSON.stringify(signed({ type: "presence", scope: undefined, presence: { reporter: { id: "other", epoch: "1", peerId: reporter.peerId }, active: true } }))));
+    await new Promise((resolve) => setTimeout(resolve, 70));
+    assert.deepEqual(activities, [], "an agent cannot claim another agent is working");
+    forged.stream.abort(new Error("test done"));
   } finally {
     await Promise.allSettled([agent.disconnect(), observer.stop()]);
     Reflect.set(AgentTelemetry.prototype, "connectPeer", connectPeer);
@@ -120,8 +128,10 @@ test("observer discovers and subscribes to agents even without an inbound observ
   const observer = new TelemetryObserver();
   const agent = new P2PIntercomClient();
   const seen: TelemetryEvent[] = [];
+  const presence: { reporter: { id: string }; active: boolean }[] = [];
   const connectPeer = AgentTelemetry.prototype.connectPeer;
   observer.on("event", (event: TelemetryEvent) => seen.push(event));
+  observer.on("presence", (update) => presence.push(update));
   try {
     await observer.start();
     // Simulate a blocked viewer TCP port: the agent cannot initiate a subscription.
@@ -129,6 +139,18 @@ test("observer discovers and subscribes to agents even without an inbound observ
     await agent.connect(registration("outbound-only"), "outbound-only");
     await wait(() => Reflect.get(observer, "active").size === 1, 10_000);
     assert.equal(Reflect.get(Reflect.get(agent, "telemetry"), "observers").size, 1);
+    await wait(() => presence.length >= 1);
+    assert.equal(presence[0]?.active, false);
+    agent.updatePresence({ status: "thinking · private note" });
+    await wait(() => presence.length === 2);
+    assert.deepEqual(presence.map((update) => update.active), [false, true]);
+    agent.updatePresence({ status: "tool:bash" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(presence.length, 2, "working-to-working transitions do not flood telemetry");
+    agent.updatePresence({ status: "idle" });
+    await wait(() => presence.length === 3);
+    assert.equal(presence[2]?.active, false);
+    assert.doesNotMatch(JSON.stringify(presence), /private note|tool:bash/);
     const session = (await agent.listSessions())[0]!;
     Reflect.get(agent, "telemetry").emit({ messageId: "mac-to-mac", from: { id: session.id, epoch: session.endpointEpoch! }, to: { id: "other-mac", epoch: "other-epoch" }, action: "send", timestamp: Date.now(), status: "attempted", body: "# Mac conversation" });
     await wait(() => seen.some((event) => event.messageId === "mac-to-mac"));
