@@ -17,7 +17,7 @@ const MAX_FRAME = 64 * 1024;
 export const MAX_TELEMETRY_BODY_BYTES = 16 * 1024;
 const text = new TextEncoder();
 const decode = new TextDecoder();
-export type Endpoint = { id: string; epoch: string; name?: string };
+export type Endpoint = { id: string; epoch: string; name?: string; hostname?: string };
 export type TelemetryPresence = { reporter: Endpoint & { peerId: string }; active: boolean };
 export type TelemetryEvent = {
   version: 1; reporter: Endpoint & { peerId: string }; eventId: string; sequence: number;
@@ -31,7 +31,7 @@ export type TelemetryEvent = {
 };
 
 export function endpoint(session: SessionInfo): Endpoint {
-  return { id: session.id.slice(0, 128), epoch: (session.endpointEpoch ?? "legacy").slice(0, 128), ...(session.name ? { name: session.name.slice(0, 128) } : {}) };
+  return { id: session.id.slice(0, 128), epoch: (session.endpointEpoch ?? "legacy").slice(0, 128), ...(session.name ? { name: session.name.slice(0, 128) } : {}), ...(session.hostname ? { hostname: session.hostname.slice(0, 128) } : {}) };
 }
 export function agentServiceTag(key: string, scope?: string): string {
   return `_pi-intercom-${createHash("sha256").update(`${key}\0${scope ?? ""}`).digest("hex").slice(0, 12)}._udp.local`;
@@ -71,7 +71,7 @@ const onlyKeys = (value: unknown, keys: string[]) => value !== null && typeof va
 function validEndpoint(value: unknown): value is Endpoint {
   if (!value || typeof value !== "object") return false;
   const e = value as Endpoint;
-  return onlyKeys(e, ["id", "epoch", "name", "peerId"]) && bounded(e.id) && bounded(e.epoch) && (e.name === undefined || (typeof e.name === "string" && e.name.length <= 128));
+  return onlyKeys(e, ["id", "epoch", "name", "hostname", "peerId"]) && bounded(e.id) && bounded(e.epoch) && (e.name === undefined || (typeof e.name === "string" && e.name.length <= 128)) && (e.hostname === undefined || bounded(e.hostname));
 }
 export function validTelemetryEvent(value: unknown, reporter: Endpoint & { peerId: string }): value is TelemetryEvent {
   if (!value || typeof value !== "object") return false;
@@ -79,7 +79,7 @@ export function validTelemetryEvent(value: unknown, reporter: Endpoint & { peerI
   const statuses = ["attempted", "socket_delivered", "failed", "receiver_received", "queued", "injected", "acknowledged", "expired", "cancelled", "superseded", "cancellation_requested"];
   const actions = ["send", "ask", "reply", "cancel", "receipt"];
   if (!onlyKeys(e, ["version", "reporter", "eventId", "sequence", "messageId", "from", "to", "action", "timestamp", "status", "replyTo", "retryOf", "supersedes", "body", "bodyTruncated", "artifacts"]) || e.version !== 1 || !validEndpoint(e.reporter) || e.reporter.peerId !== reporter.peerId || e.reporter.id !== reporter.id || e.reporter.epoch !== reporter.epoch || !bounded(e.eventId) || !Number.isSafeInteger(e.sequence) || e.sequence < 1 || !bounded(e.messageId) || !validEndpoint(e.from) || !validEndpoint(e.to) || !actions.includes(e.action) || !statuses.includes(e.status) || !Number.isFinite(e.timestamp)) return false;
-  if (!onlyKeys(e.from, ["id", "epoch", "name"]) || !onlyKeys(e.to, ["id", "epoch", "name"]) || ![e.from, e.to].some((p) => p.id === reporter.id && p.epoch === reporter.epoch)) return false;
+  if (!onlyKeys(e.from, ["id", "epoch", "name", "hostname"]) || !onlyKeys(e.to, ["id", "epoch", "name", "hostname"]) || ![e.from, e.to].some((p) => p.id === reporter.id && p.epoch === reporter.epoch)) return false;
   if ([e.replyTo, e.retryOf, e.supersedes].some((s) => s !== undefined && !bounded(s))) return false;
   if (e.body !== undefined && (typeof e.body !== "string" || text.encode(e.body).length > MAX_TELEMETRY_BODY_BYTES || e.action === "cancel" || e.action === "receipt")) return false;
   if (e.bodyTruncated !== undefined && (typeof e.bodyTruncated !== "boolean" || e.body === undefined)) return false;

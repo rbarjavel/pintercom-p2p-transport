@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { lpStream } from "@libp2p/utils";
 import { P2PIntercomClient } from "./client.ts";
-import { AgentTelemetry, TelemetryObserver, TELEMETRY_PROTOCOL, MAX_TELEMETRY_BODY_BYTES, projectMessage, projectArtifacts, validTelemetryEvent, type TelemetryEvent } from "./telemetry.ts";
+import { AgentTelemetry, TelemetryObserver, TELEMETRY_PROTOCOL, MAX_TELEMETRY_BODY_BYTES, endpoint, projectMessage, projectArtifacts, validTelemetryEvent, type TelemetryEvent } from "./telemetry.ts";
 import type { SessionRegistration } from "../types.ts";
 
 const registration = (name: string): SessionRegistration => ({ name, cwd: "/private/secret", model: "test", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() });
@@ -30,13 +30,15 @@ const wait = async (predicate: () => boolean, ms = 3000) => {
 };
 
 test("projection whitelists metadata, classifies actions and preserves unknown sizes", () => {
-  const from = { id: "a", epoch: "1" }, to = { id: "b", epoch: "2" };
+  const from = endpoint({ ...registration("agent"), id: "a", endpointEpoch: "1", hostname: "host-a" }), to = { id: "b", epoch: "2", hostname: "host-b" };
   const message = { id: "m", timestamp: 1, replyTo: "prior", expectsReply: true, retryOf: "retry", supersedes: "old", content: { text: "PRIVATE BODY", attachments: [{ name: "safe", type: "context" as const, content: "SECRET ATTACHMENT" }] } };
   const projected = projectMessage(message, from, to, "failed", [{ path: "folder/file", type: "file", size: 3 }, { path: "folder", type: "directory" }]);
   assert.equal(projected.action, "reply");
   assert.equal(projected.status, "failed");
   assert.equal(projected.retryOf, "retry");
   assert.equal(projected.supersedes, "old");
+  assert.equal(projected.from.hostname, "host-a");
+  assert.equal(projected.to.hostname, "host-b");
   assert.deepEqual(projected.artifacts?.manifest[1], { path: "folder", type: "directory" });
   assert.doesNotMatch(JSON.stringify(projected), /PRIVATE BODY|SECRET ATTACHMENT|\/private\/secret/);
   const withBody = projectMessage(message, from, to, "attempted", undefined, true);
@@ -57,6 +59,8 @@ test("schema rejects unrelated reporters, absolute artifact paths and invalid fi
   const reporter = { id: "a", epoch: "1", peerId: "peer" };
   const event: TelemetryEvent = { version: 1, reporter, eventId: "x", sequence: 1, messageId: "m", from: { id: "a", epoch: "1" }, to: { id: "b", epoch: "1" }, action: "send", timestamp: Date.now(), status: "attempted" };
   assert.equal(validTelemetryEvent(event, reporter), true);
+  assert.equal(validTelemetryEvent({ ...event, from: { id: "a", epoch: "1", hostname: "host-a" } }, reporter), true);
+  assert.equal(validTelemetryEvent({ ...event, from: { id: "a", epoch: "1", hostname: "x".repeat(129) } }, reporter), false);
   assert.equal(validTelemetryEvent({ ...event, from: { id: "c", epoch: "1" } }, reporter), false);
   assert.equal(validTelemetryEvent({ ...event, reporter: { ...reporter, peerId: "fake" } }, reporter), false);
   assert.equal(validTelemetryEvent({ ...event, body: "safe **markdown**" }, reporter), true);
