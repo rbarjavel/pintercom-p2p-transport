@@ -38,6 +38,7 @@ export function createViewerServer(observer: EventEmitter): Server {
   const interactions = new Map<string, Interaction>();
   const seen = new Map<string, Set<string>>();
   const clients = new Set<ServerResponse>();
+  const reporters = new Set<string>();
   let truncated = false;
   let partial = false;
   const send = (response: ServerResponse, name: string, data: unknown) => {
@@ -83,9 +84,11 @@ export function createViewerServer(observer: EventEmitter): Server {
     if (interaction.updates.length > MAX_UPDATES) interaction.updates.shift();
     broadcast("interaction", { interaction, evicted, truncated, partial });
   };
-  const onStatus = (status: { partial?: boolean; dropped?: number }) => {
+  const onStatus = (status: { partial?: boolean; dropped?: number; connected?: boolean; reporter?: { peerId: string }; peerId?: string }) => {
     if (status.partial) partial = true;
-    broadcast("status", { ...status, truncated, partial });
+    if (status.connected && status.reporter?.peerId) reporters.add(status.reporter.peerId);
+    if (status.connected === false && status.peerId) reporters.delete(status.peerId);
+    broadcast("status", { ...status, connectedReporters: reporters.size, truncated, partial });
   };
   observer.on("event", onEvent);
   observer.on("status", onStatus);
@@ -111,7 +114,7 @@ export function createViewerServer(observer: EventEmitter): Server {
       });
       clients.add(response);
       response.on("close", () => clients.delete(response));
-      let snapshot = { interactions: [...interactions.values()], truncated, partial };
+      let snapshot = { interactions: [...interactions.values()], connectedReporters: reporters.size, truncated, partial };
       if (Buffer.byteLength(JSON.stringify(snapshot)) > MAX_BUFFER - 1024) {
         // ponytail: trim snapshot artifact descriptors before an oversized write; totals and omitted counts remain accurate.
         snapshot = { ...snapshot, interactions: snapshot.interactions.map((interaction) => {

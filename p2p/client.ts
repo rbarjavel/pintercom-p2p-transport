@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
-import { AgentTelemetry, endpoint, observerServiceTag, projectMessage, type Endpoint, type TelemetryEvent } from "./telemetry.ts";
-import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { AgentTelemetry, agentServiceTag, endpoint, observerServiceTag, TELEMETRY_PROTOCOL, projectMessage, type Endpoint, type TelemetryEvent } from "./telemetry.ts";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { createLibp2p, type Libp2p } from "libp2p";
 import { tcp } from "@libp2p/tcp";
 import { mdns } from "@libp2p/mdns";
@@ -126,11 +126,6 @@ function getP2PRequestTimeoutMs(): number {
   return Number.isFinite(timeout) && timeout > 0 ? timeout : 30_000;
 }
 
-function serviceTag(key: string, scopeId: string | undefined): string {
-  const suffix = createHash("sha256").update(`${key}\0${scopeId ?? ""}`).digest("hex").slice(0, 12);
-  return `_pi-intercom-${suffix}._udp.local`;
-}
-
 async function readJson(stream: Stream): Promise<unknown> {
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -193,7 +188,7 @@ export class P2PIntercomClient extends EventEmitter {
     this._sessionId = sessionId;
     this.registration = { ...session, id: sessionId, endpointEpoch, trustedLocal: false };
 
-    const mdnsServiceTag = serviceTag(this.key, this.scopeId);
+    const mdnsServiceTag = agentServiceTag(this.key, this.scopeId);
     const createMdns = mdns({ serviceTag: mdnsServiceTag });
     let mdnsService: ReturnType<typeof createMdns> | undefined;
     const telemetryEnabled = process.env.PI_INTERCOM_TELEMETRY !== "0";
@@ -217,6 +212,7 @@ export class P2PIntercomClient extends EventEmitter {
     this.node = node;
     if (telemetryEnabled) this.telemetry = new AgentTelemetry(node, this.registration);
     await node.handle(PROTOCOL, (stream, connection) => this.handleStream(stream, connection));
+    if (this.telemetry) await node.handle(TELEMETRY_PROTOCOL, (stream, connection) => this.telemetry?.acceptObserver(stream, connection.remotePeer), { maxInboundStreams: 64, maxOutboundStreams: 64 });
     await node.handle(TRANSFER_PROTOCOL, (stream, connection) => this.handleTransferStream(stream, connection), {
       maxInboundStreams: 2,
       maxOutboundStreams: 2,

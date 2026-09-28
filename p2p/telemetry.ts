@@ -32,6 +32,9 @@ export type TelemetryEvent = {
 export function endpoint(session: SessionInfo): Endpoint {
   return { id: session.id.slice(0, 128), epoch: (session.endpointEpoch ?? "legacy").slice(0, 128), ...(session.name ? { name: session.name.slice(0, 128) } : {}) };
 }
+export function agentServiceTag(key: string, scope?: string): string {
+  return `_pi-intercom-${createHash("sha256").update(`${key}\0${scope ?? ""}`).digest("hex").slice(0, 12)}._udp.local`;
+}
 export function observerServiceTag(key: string, scope?: string): string {
   return `_pi-intercom-view-${createHash("sha256").update(`${key}\0${scope ?? ""}\0observer`).digest("hex").slice(0, 12)}._udp.local`;
 }
@@ -115,6 +118,21 @@ export class AgentTelemetry {
   private dropped = 0;
   private closed = false;
   constructor(private node: Libp2p, private session: SessionInfo) {}
+  /** Accept a viewer that dialed this agent through the regular P2P discovery service. */
+  async acceptObserver(stream: Stream, peerId: PeerId): Promise<void> {
+    try {
+      if (this.closed) throw new Error("Telemetry stopped");
+      const frame = framed(stream);
+      const hello = verify(this.key, await readFrame(frame, AbortSignal.timeout(5_000))) as { type?: string; version?: number; scope?: string; observerPeerId?: string };
+      if (hello.type !== "subscribe" || hello.version !== 1 || hello.scope !== this.scope || hello.observerPeerId !== peerId.toString()) throw new Error("Invalid observer subscription");
+      await writeFrame(frame, sign(this.key, { type: "subscribed", scope: this.scope, reporter: { ...endpoint(this.session), peerId: this.node.peerId.toString() } }));
+      const id = peerId.toString();
+      if (this.closed || this.observers.has(id) || this.observers.size >= 32) throw new Error("Duplicate or excess observer");
+      const observer = { stream, queue: [] as TelemetryEvent[], writing: false };
+      this.observers.set(id, observer);
+      stream.addEventListener("close", () => { if (this.observers.get(id) === observer) this.observers.delete(id); });
+    } catch { stream.abort(new Error("Telemetry subscription rejected")); }
+  }
   async connectPeer(peerId: PeerId): Promise<void> {
     const id = peerId.toString();
     if (this.closed || peerId.equals(this.node.peerId)) return;
@@ -136,8 +154,10 @@ export class AgentTelemetry {
       if (response.type !== "subscribed" || response.scope !== this.scope) throw new Error("Invalid telemetry subscription");
       if (this.closed) { stream.abort(new Error("Telemetry stopped")); return; }
       retry.attempts = 0;
-      this.observers.set(id, { stream, queue: [], writing: false });
-      stream.addEventListener("close", () => { this.observers.delete(id); this.retry(peerId); });
+      if (this.observers.has(id)) { stream.abort(new Error("Already subscribed")); return; }
+      const observer = { stream, queue: [] as TelemetryEvent[], writing: false };
+      this.observers.set(id, observer);
+      stream.addEventListener("close", () => { if (this.observers.get(id) === observer) { this.observers.delete(id); this.retry(peerId); } });
     } catch { this.retry(peerId); }
     finally { this.pending.delete(id); }
   }
@@ -187,19 +207,31 @@ export class AgentTelemetry {
   }
 }
 
-/** Observer is not registered as an intercom session and handles telemetry protocol only. */
+/** Observer is not registered as an intercom session; it dials agents and accepts older agents dialing it. */
 export class TelemetryObserver extends EventEmitter {
   private readonly key = telemetryKey();
   private readonly scope = getIntercomScopeId();
+  private readonly connecting = new Set<string>();
+  private readonly active = new Set<string>();
   node: Libp2p | null = null;
   async start(): Promise<void> {
     if (this.node) throw new Error("Observer already started");
     const tag = observerServiceTag(this.key, this.scope);
     const createMdns = mdns({ serviceTag: tag });
+    const discoverAgents = mdns({ serviceTag: agentServiceTag(this.key, this.scope), broadcast: false });
     let discovery: ReturnType<typeof createMdns> | undefined;
-    const node = await createLibp2p({ start: false, addresses: { listen: ["/ip4/0.0.0.0/tcp/0"] }, transports: [tcp()], connectionEncrypters: [noise()], streamMuxers: [yamux()], peerDiscovery: [(components) => { discovery = createMdns(components); return discovery; }] });
+    let agentDiscovery: ReturnType<typeof discoverAgents> | undefined;
+    const node = await createLibp2p({ start: false, addresses: { listen: ["/ip4/0.0.0.0/tcp/0"] }, transports: [tcp()], connectionEncrypters: [noise()], streamMuxers: [yamux()], peerDiscovery: [
+      (components) => { discovery = createMdns(components); return discovery; },
+      (components) => { agentDiscovery = discoverAgents(components); return agentDiscovery; },
+    ] });
     this.node = node;
-    await node.handle(TELEMETRY_PROTOCOL, (stream, connection) => this.handle(stream, connection.remotePeer), { maxInboundStreams: 64, maxOutboundStreams: 0 });
+    await node.handle(TELEMETRY_PROTOCOL, (stream, connection) => this.handle(stream, connection.remotePeer), { maxInboundStreams: 64, maxOutboundStreams: 64 });
+    agentDiscovery?.addEventListener("peer", (event) => {
+      if (event.detail.id.equals(node.peerId)) return;
+      void node.peerStore.merge(event.detail.id, { multiaddrs: event.detail.multiaddrs })
+        .then(() => this.subscribe(event.detail.id)).catch(() => undefined);
+    });
     await node.start();
     // Advertise the actual bound TCP addresses, including LAN public-range subnets.
     const components = (node as Libp2p & { components: { transportManager: { getAddrs(): ReturnType<Libp2p["getMultiaddrs"]> }; addressManager: { confirmObservedAddr(addr: ReturnType<Libp2p["getMultiaddrs"]>[number], options: { type: "transport" }): void } } }).components;
@@ -213,15 +245,38 @@ export class TelemetryObserver extends EventEmitter {
       }
     });
   }
-  async stop(): Promise<void> { const node = this.node; this.node = null; await node?.stop(); }
+  async stop(): Promise<void> { const node = this.node; this.node = null; await node?.stop(); this.connecting.clear(); this.active.clear(); }
+  private async subscribe(peerId: PeerId): Promise<void> {
+    const node = this.node, id = peerId.toString();
+    if (!node || this.connecting.has(id) || this.active.has(id) || this.connecting.size + this.active.size >= 64) return;
+    this.connecting.add(id);
+    let stream: Stream | undefined;
+    try {
+      stream = await node.dialProtocol(peerId, TELEMETRY_PROTOCOL, { signal: AbortSignal.timeout(5_000) });
+      const frame = framed(stream);
+      await writeFrame(frame, sign(this.key, { type: "subscribe", version: 1, scope: this.scope, observerPeerId: node.peerId.toString() }));
+      const response = verify(this.key, await readFrame(frame, AbortSignal.timeout(5_000))) as { type?: string; scope?: string; reporter?: Endpoint & { peerId?: string } };
+      if (response.type !== "subscribed" || response.scope !== this.scope || !validEndpoint(response.reporter) || response.reporter?.peerId !== id) throw new Error("Invalid agent subscription");
+      await this.consume(stream, peerId, response.reporter as Endpoint & { peerId: string });
+    } catch { stream?.abort(new Error("Telemetry connection failed")); }
+    finally { this.connecting.delete(id); }
+  }
   private async handle(stream: Stream, peerId: PeerId): Promise<void> {
     try {
       const frame = framed(stream);
       const hello = verify(this.key, await readFrame(frame, AbortSignal.timeout(5_000))) as { type?: string; version?: number; scope?: string; reporter?: Endpoint & { peerId?: string } };
       if (hello.type !== "subscribe" || hello.version !== 1 || hello.scope !== this.scope || !validEndpoint(hello.reporter) || hello.reporter?.peerId !== peerId.toString()) throw new Error("Invalid telemetry subscription");
-      const reporter = hello.reporter as Endpoint & { peerId: string };
       await writeFrame(frame, sign(this.key, { type: "subscribed", scope: this.scope }));
-      this.emit("status", { connected: true, reporter });
+      await this.consume(stream, peerId, hello.reporter as Endpoint & { peerId: string });
+    } catch { stream.abort(new Error("Telemetry subscription rejected")); }
+  }
+  private async consume(stream: Stream, peerId: PeerId, reporter: Endpoint & { peerId: string }): Promise<void> {
+    const id = peerId.toString();
+    if (this.active.has(id) || this.active.size >= 64) { stream.abort(new Error("Duplicate telemetry connection")); return; }
+    this.active.add(id);
+    this.emit("status", { connected: true, reporter });
+    try {
+      const frame = framed(stream);
       for (;;) {
         const payload = verify(this.key, await readFrame(frame)) as { type?: string; scope?: string; event?: unknown; dropped?: number };
         if (payload.type !== "event" || payload.scope !== this.scope || !validTelemetryEvent(payload.event, reporter) || !Number.isSafeInteger(payload.dropped) || payload.dropped! < 0) throw new Error("Invalid telemetry event");
@@ -229,6 +284,6 @@ export class TelemetryObserver extends EventEmitter {
         if (payload.dropped) this.emit("status", { partial: true, dropped: payload.dropped });
       }
     } catch { /* malformed or disconnected streams are not trusted */ }
-    finally { stream.abort(new Error("Telemetry closed")); this.emit("status", { connected: false, peerId: peerId.toString() }); }
+    finally { stream.abort(new Error("Telemetry closed")); this.active.delete(id); this.emit("status", { connected: false, peerId: id }); }
   }
 }

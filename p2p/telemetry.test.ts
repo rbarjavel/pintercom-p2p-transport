@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { lpStream } from "@libp2p/utils";
 import { P2PIntercomClient } from "./client.ts";
-import { TelemetryObserver, TELEMETRY_PROTOCOL, MAX_TELEMETRY_BODY_BYTES, projectMessage, projectArtifacts, validTelemetryEvent, type TelemetryEvent } from "./telemetry.ts";
+import { AgentTelemetry, TelemetryObserver, TELEMETRY_PROTOCOL, MAX_TELEMETRY_BODY_BYTES, projectMessage, projectArtifacts, validTelemetryEvent, type TelemetryEvent } from "./telemetry.ts";
 import type { SessionRegistration } from "../types.ts";
 
 const registration = (name: string): SessionRegistration => ({ name, cwd: "/private/secret", model: "test", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() });
@@ -69,6 +69,10 @@ test("observer rejects wrong key, scope, oversized frames and unrelated reports"
   const oldKey = process.env.PI_INTERCOM_P2P_KEY;
   process.env.PI_INTERCOM_P2P_KEY = key;
   const observer = new TelemetryObserver();
+  // Exercise the legacy inbound authentication path without automatic subscriptions racing it.
+  Reflect.set(observer, "subscribe", async () => undefined);
+  const connectPeer = AgentTelemetry.prototype.connectPeer;
+  Reflect.set(AgentTelemetry.prototype, "connectPeer", async () => undefined);
   const agent = new P2PIntercomClient();
   const seen: unknown[] = [];
   observer.on("event", (event) => seen.push(event));
@@ -104,6 +108,33 @@ test("observer rejects wrong key, scope, oversized frames and unrelated reports"
     assert.deepEqual(seen, []);
     good.stream.abort(new Error("test done"));
   } finally {
+    await Promise.allSettled([agent.disconnect(), observer.stop()]);
+    Reflect.set(AgentTelemetry.prototype, "connectPeer", connectPeer);
+    if (oldKey === undefined) delete process.env.PI_INTERCOM_P2P_KEY; else process.env.PI_INTERCOM_P2P_KEY = oldKey;
+  }
+});
+
+test("observer discovers and subscribes to agents even without an inbound observer connection", async () => {
+  const oldKey = process.env.PI_INTERCOM_P2P_KEY;
+  process.env.PI_INTERCOM_P2P_KEY = key;
+  const observer = new TelemetryObserver();
+  const agent = new P2PIntercomClient();
+  const seen: TelemetryEvent[] = [];
+  const connectPeer = AgentTelemetry.prototype.connectPeer;
+  observer.on("event", (event: TelemetryEvent) => seen.push(event));
+  try {
+    await observer.start();
+    // Simulate a blocked viewer TCP port: the agent cannot initiate a subscription.
+    Reflect.set(AgentTelemetry.prototype, "connectPeer", async () => undefined);
+    await agent.connect(registration("outbound-only"), "outbound-only");
+    await wait(() => Reflect.get(observer, "active").size === 1, 10_000);
+    assert.equal(Reflect.get(Reflect.get(agent, "telemetry"), "observers").size, 1);
+    const session = (await agent.listSessions())[0]!;
+    Reflect.get(agent, "telemetry").emit({ messageId: "mac-to-mac", from: { id: session.id, epoch: session.endpointEpoch! }, to: { id: "other-mac", epoch: "other-epoch" }, action: "send", timestamp: Date.now(), status: "attempted", body: "# Mac conversation" });
+    await wait(() => seen.some((event) => event.messageId === "mac-to-mac"));
+    assert.equal(seen.at(-1)?.body, "# Mac conversation");
+  } finally {
+    Reflect.set(AgentTelemetry.prototype, "connectPeer", connectPeer);
     await Promise.allSettled([agent.disconnect(), observer.stop()]);
     if (oldKey === undefined) delete process.env.PI_INTERCOM_P2P_KEY; else process.env.PI_INTERCOM_P2P_KEY = oldKey;
   }
