@@ -87,6 +87,7 @@ test("viewer serves local HTML, bounded snapshot and live interaction updates", 
       assert.equal(snapshot.type, "snapshot");
       assert.equal(snapshot.data.interactions.length, 1_000);
       assert.equal(snapshot.data.truncated, true);
+      assert.equal(snapshot.data.connectedReporters, 0);
       assert.equal(snapshot.data.interactions[0].messageId, "message-1");
       observer.emit("event", { ...event("message-1000", "receiver_received"), body: "# Shared **Markdown**\n<script>not executable</script>" });
       const update = await nextFrame();
@@ -111,8 +112,12 @@ test("viewer serves local HTML, bounded snapshot and live interaction updates", 
       observer.emit("event", { ...event("message-1001"), eventId: "restart", from: { id: "sender", epoch: "new-epoch", name: "Sender" } });
       const restarted = await nextFrame();
       assert.notEqual(restarted.data.interaction.id, insertion.data.interaction.id, "restarted endpoints remain distinct despite duplicate names and IDs");
+      observer.emit("status", { connected: true, reporter: { peerId: "remote-peer" } });
+      assert.equal((await nextFrame()).data.connectedReporters, 1);
       observer.emit("status", { partial: true, dropped: 2 });
-      assert.deepEqual(await nextFrame(), { type: "status", data: { partial: true, dropped: 2, truncated: true } });
+      assert.deepEqual(await nextFrame(), { type: "status", data: { partial: true, dropped: 2, connectedReporters: 1, truncated: true } });
+      observer.emit("status", { connected: false, peerId: "remote-peer" });
+      assert.equal((await nextFrame()).data.connectedReporters, 0);
     } finally { controller.abort(); }
   } finally {
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));

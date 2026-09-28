@@ -145,9 +145,9 @@ window.addEventListener('resize',()=> { for (const record of windows.values()) c
 const stream=new EventSource('/events');
 stream.addEventListener('open',()=> { $('#connection').textContent='Live'; $('#connection').classList.add('live'); });
 stream.addEventListener('error',()=> { $('#connection').textContent='Reconnecting…'; $('#connection').classList.remove('live'); });
-stream.addEventListener('snapshot',event=> { try { const data=JSON.parse(event.data); items.clear(); for (const item of data.interactions) items.set(item.id,item); truncated=data.truncated; partial=data.partial; reconcile(true); } catch { $('#notice').textContent='Invalid telemetry snapshot'; } });
+stream.addEventListener('snapshot',event=> { try { const data=JSON.parse(event.data); items.clear(); for (const item of data.interactions) items.set(item.id,item); truncated=data.truncated; partial=data.partial; connected=data.connectedReporters ?? 0; reconcile(); } catch { $('#notice').textContent='Invalid telemetry snapshot'; } });
 stream.addEventListener('interaction',event=> { try { const data=JSON.parse(event.data); if (data.evicted) items.delete(data.evicted); items.set(data.interaction.id,data.interaction); truncated=data.truncated; partial=data.partial; reconcile(); } catch { $('#notice').textContent='Invalid telemetry update'; } });
-stream.addEventListener('status',event=> { try { const status=JSON.parse(event.data); if (status.connected===true) connected++; if (status.connected===false) connected=Math.max(0,connected-1); partial ||= !!status.partial; truncated ||= !!status.truncated; notice(); } catch { $('#notice').textContent='Invalid telemetry status'; } });
+stream.addEventListener('status',event=> { try { const status=JSON.parse(event.data); if (Number.isSafeInteger(status.connectedReporters)) connected=status.connectedReporters; partial ||= !!status.partial; truncated ||= !!status.truncated; notice(); } catch { $('#notice').textContent='Invalid telemetry status'; } });
 </script>
 </body>
 </html>
