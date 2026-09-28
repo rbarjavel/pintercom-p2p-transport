@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { EvidenceStore, EVIDENCE_TRANSFER_PROTOCOL, parseEvidenceSelection, type EvidenceSelection } from "../evidence.ts";
+import { AgentTelemetry, endpoint, observerServiceTag, projectMessage, type Endpoint, type TelemetryEvent } from "./telemetry.ts";
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { createLibp2p, type Libp2p } from "libp2p";
 import { tcp } from "@libp2p/tcp";
@@ -150,7 +151,8 @@ async function readJson(stream: Stream): Promise<unknown> {
     data.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return JSON.parse(decoder.decode(data));
+  try { return JSON.parse(decoder.decode(data)); }
+  catch { throw new Error("Invalid p2p JSON message"); }
 }
 
 async function writeJson(stream: Stream, value: unknown): Promise<void> {
@@ -171,6 +173,11 @@ export class P2PIntercomClient extends EventEmitter {
   private readonly inboundRoutes = new Map<string, PeerId>();
   private readonly outboundRoutes = new Map<string, PeerId>();
   private nextSenderSequence = 1;
+  private telemetry: AgentTelemetry | null = null;
+  private telemetryContent = false;
+  private readonly outboundEndpoints = new Map<string, Endpoint>();
+  private readonly inboundEndpoints = new Map<string, Endpoint>();
+  private readonly outboundMessages = new Map<string, Message>();
 
   get sessionId(): string | null {
     return this._sessionId;
@@ -194,6 +201,10 @@ export class P2PIntercomClient extends EventEmitter {
     const mdnsServiceTag = serviceTag(this.key, this.scopeId);
     const createMdns = mdns({ serviceTag: mdnsServiceTag });
     let mdnsService: ReturnType<typeof createMdns> | undefined;
+    const telemetryEnabled = process.env.PI_INTERCOM_TELEMETRY !== "0";
+    this.telemetryContent = telemetryEnabled && process.env.PI_INTERCOM_TELEMETRY_CONTENT !== "0";
+    const createObserverDiscovery = mdns({ serviceTag: observerServiceTag(this.key, this.scopeId) });
+    let observerDiscovery: ReturnType<typeof createObserverDiscovery> | undefined;
     const node = await createLibp2p({
       start: false,
       addresses: { listen: ["/ip4/0.0.0.0/tcp/0"] },
@@ -203,9 +214,13 @@ export class P2PIntercomClient extends EventEmitter {
       peerDiscovery: [(components) => {
         mdnsService = createMdns(components);
         return mdnsService;
-      }],
+      }, ...(telemetryEnabled ? [(components: Parameters<typeof createObserverDiscovery>[0]) => {
+        observerDiscovery = createObserverDiscovery(components);
+        return observerDiscovery;
+      }] : [])],
     });
     this.node = node;
+    if (telemetryEnabled) this.telemetry = new AgentTelemetry(node, this.registration);
     await node.handle(PROTOCOL, (stream, connection) => this.handleStream(stream, connection));
     await node.handle(TRANSFER_PROTOCOL, (stream, connection) => this.handleTransferStream(stream, connection), {
       maxInboundStreams: 2,
@@ -223,6 +238,11 @@ export class P2PIntercomClient extends EventEmitter {
         .then(() => this.announceToPeer(event.detail.id))
         .catch(() => undefined);
     });
+    observerDiscovery?.addEventListener("peer", (event) => {
+      if (event.detail.id.equals(node.peerId)) return;
+      void node.peerStore.merge(event.detail.id, { multiaddrs: event.detail.multiaddrs })
+        .then(() => this.telemetry?.connectPeer(event.detail.id)).catch(() => undefined);
+    });
     node.addEventListener("peer:connect", (event) => {
       if (!event.detail.equals(node.peerId)) void this.announceToPeer(event.detail);
     });
@@ -232,7 +252,8 @@ export class P2PIntercomClient extends EventEmitter {
 
     // @libp2p/mdns drops public-range addresses even when they are on the local
     // link. Add a response on its existing socket with only our bound addresses.
-    const mdnsSocket = mdnsService?.mdns;
+    // PeerDiscovery's public type omits the mDNS socket exposed by its implementation.
+    const mdnsSocket = (mdnsService as typeof mdnsService & { mdns?: { on(event: "query", handler: (query: { questions: Array<{ name: string; type: string }> }) => void): void; respond(answers: ReturnType<typeof p2pMdnsAnswers>): void } } | undefined)?.mdns;
     mdnsSocket?.on("query", (query) => {
       if (query.questions.some(({ name, type }) => name === mdnsServiceTag && type === "PTR")) {
         mdnsSocket.respond(p2pMdnsAnswers(mdnsServiceTag, node.peerId.toString(), node.getMultiaddrs()));
@@ -246,6 +267,12 @@ export class P2PIntercomClient extends EventEmitter {
   async disconnect(): Promise<void> {
     const node = this.node;
     if (!node) return;
+    this.telemetry?.stop();
+    this.telemetry = null;
+    this.telemetryContent = false;
+    this.outboundEndpoints.clear();
+    this.inboundEndpoints.clear();
+    this.outboundMessages.clear();
     this.node = null;
     this._sessionId = null;
     this.registration = null;
@@ -280,13 +307,21 @@ export class P2PIntercomClient extends EventEmitter {
       provenance: options.provenance,
       content: { text: options.text, attachments: options.attachments },
     };
-    const response = await this.request(target.peerId, {
+    this.remember(this.outboundEndpoints, messageId, endpoint(target.session));
+    this.remember(this.outboundMessages, messageId, message);
+    this.report(() => projectMessage(message, endpoint(this.registration!), endpoint(target.session), "attempted", undefined, this.telemetryContent));
+    let response: PeerResponse;
+    try { response = await this.request(target.peerId, {
       type: "message",
       scopeId: this.scopeId,
       from: this.registration,
       to: target.session.id,
       message,
-    });
+    }); } catch (error) {
+      this.report(() => projectMessage(message, endpoint(this.registration!), endpoint(target.session), "failed", undefined, this.telemetryContent));
+      throw error;
+    }
+    this.report(() => projectMessage(message, endpoint(this.registration!), endpoint(target.session), response.ok ? "socket_delivered" : "failed", undefined, this.telemetryContent));
     if (!response.ok) {
       return { id: messageId, delivered: false, reason: response.reason, delivery: "failed", retryable: true, outcomeKnown: true };
     }
@@ -316,6 +351,9 @@ export class P2PIntercomClient extends EventEmitter {
       provenance: options.provenance,
       content: { text: options.text, attachments: options.attachments },
     };
+    this.remember(this.outboundEndpoints, messageId, endpoint(target.session));
+    this.remember(this.outboundMessages, messageId, message);
+    this.report(() => projectMessage(message, endpoint(this.registration!), endpoint(target.session), "attempted", source.manifest, this.telemetryContent));
     const envelope: TransferEnvelope = {
       type: "transfer",
       scopeId: this.scopeId,
@@ -338,11 +376,13 @@ export class P2PIntercomClient extends EventEmitter {
       await stream.close();
       const response = this.verify(decodeTransferJson(await framed.read({ signal }))) as PeerResponse;
       if (!response || typeof response !== "object" || typeof response.ok !== "boolean") throw new Error("Invalid p2p transfer response");
+      this.report(() => projectMessage(message, endpoint(this.registration!), endpoint(target.session), response.ok ? "socket_delivered" : "failed", source.manifest, this.telemetryContent));
       if (!response.ok) return { id: messageId, delivered: false, reason: response.reason, delivery: "failed", retryable: true, outcomeKnown: true };
       if (evidence && typeof response.evidenceId !== "string") throw new Error("Peer did not acknowledge durable evidence storage");
       this.outboundRoutes.set(messageId, target.peerId);
       return { id: messageId, delivered: true, delivery: "socket_delivered", retryable: false, outcomeKnown: true, storedAt: response.storedAt };
     } catch (error) {
+      this.report(() => projectMessage(message, endpoint(this.registration!), endpoint(target.session), "failed", source.manifest, this.telemetryContent));
       stream?.abort(toError(error));
       throw error;
     } finally {
@@ -355,12 +395,19 @@ export class P2PIntercomClient extends EventEmitter {
     if (!peerId || !this.registration) {
       return { id: messageId, delivered: false, reason: "Message target is no longer connected.", delivery: "failed", retryable: true, outcomeKnown: true };
     }
-    const response = await this.request(peerId, {
+    const to = this.outboundEndpoints.get(messageId);
+    if (to) this.report({ messageId, from: endpoint(this.registration), to, action: "cancel", timestamp: Date.now(), status: "attempted" });
+    let response: PeerResponse;
+    try { response = await this.request(peerId, {
       type: "control",
       scopeId: this.scopeId,
       from: this.registration,
       control: { messageId, action: "cancel", timestamp: Date.now() },
-    });
+    }); } catch (error) {
+      if (to) this.report({ messageId, from: endpoint(this.registration), to, action: "cancel", timestamp: Date.now(), status: "failed" });
+      throw error;
+    }
+    if (to) this.report({ messageId, from: endpoint(this.registration), to, action: "cancel", timestamp: Date.now(), status: response.ok ? "socket_delivered" : "failed" });
     return response.ok
       ? { id: messageId, delivered: true, delivery: "socket_delivered", retryable: false, outcomeKnown: true }
       : { id: messageId, delivered: false, reason: response.reason, delivery: "failed", retryable: true, outcomeKnown: true };
@@ -373,14 +420,16 @@ export class P2PIntercomClient extends EventEmitter {
   sendMessageReceipt(receipt: MessageReceipt): void {
     const peerId = this.inboundRoutes.get(receipt.messageId);
     if (!peerId || !this.registration) return;
+    const to = this.inboundEndpoints.get(receipt.messageId);
+    if (to) this.report({ messageId: receipt.messageId, from: to, to: endpoint(this.registration), action: "receipt", timestamp: receipt.timestamp, status: receipt.status });
     void this.request(peerId, { type: "receipt", scopeId: this.scopeId, from: this.registration, receipt }).catch(() => undefined);
   }
 
   updatePresence(updates: { name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null; activeToolDetail?: string | null; lastToolDetail?: string | null }): void {
     if (!this.registration) return;
     for (const [key, value] of Object.entries(updates)) {
-      if (value === null) delete (this.registration as unknown as Record<string, unknown>)[key];
-      else if (value !== undefined) (this.registration as unknown as Record<string, unknown>)[key] = value;
+      if (value === null) Reflect.deleteProperty(this.registration, key);
+      else if (value !== undefined) Reflect.set(this.registration, key, value);
     }
     this.registration.lastActivity = Date.now();
     this.emit("presence_update", this.registration);
@@ -410,6 +459,16 @@ export class P2PIntercomClient extends EventEmitter {
     return () => this.off("message_control", handler);
   }
 
+  private remember<T>(map: Map<string, T>, id: string, value: T): void {
+    map.set(id, value);
+    if (map.size > 1000) map.delete(map.keys().next().value!);
+  }
+
+  private report(event: Omit<TelemetryEvent, "version" | "reporter" | "eventId" | "sequence"> | (() => Omit<TelemetryEvent, "version" | "reporter" | "eventId" | "sequence">)): void {
+    if (!this.telemetry) return;
+    try { this.telemetry.emit(typeof event === "function" ? event() : event); } catch { /* Observability cannot affect messaging. */ }
+  }
+
   private resolveTarget(to: string): PeerSession | null {
     const sessions = [...this.peers.values()];
     const exact = sessions.find(({ session }) => session.id === to);
@@ -435,14 +494,15 @@ export class P2PIntercomClient extends EventEmitter {
     return { payload, mac: createHmac("sha256", this.key).update(json).digest("hex") };
   }
 
-  private verify(value: unknown): unknown {
+  private verify(value: unknown): Record<string, unknown> {
     if (!value || typeof value !== "object") throw new Error("Invalid authenticated p2p message");
     const wire = value as { payload?: unknown; mac?: unknown };
     if (typeof wire.mac !== "string") throw new Error("Invalid authenticated p2p message");
     const expected = createHmac("sha256", this.key).update(JSON.stringify(wire.payload)).digest();
     const actual = Buffer.from(wire.mac, "hex");
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw new Error("P2P message authentication failed");
-    return wire.payload;
+    if (!wire.payload || typeof wire.payload !== "object" || Array.isArray(wire.payload)) throw new Error("Invalid authenticated p2p payload");
+    return wire.payload as Record<string, unknown>;
   }
 
   private async request(peerId: PeerId, envelope: PeerEnvelope): Promise<PeerResponse> {
@@ -517,7 +577,8 @@ export class P2PIntercomClient extends EventEmitter {
         envelope.transferId,
         envelope.manifest,
         (completionValue) => {
-          const completion = this.verify(completionValue) as TransferCompletion;
+          // SAFETY: transfer completion is checked by the receiver after authenticated decoding.
+          const completion = this.verify(completionValue) as unknown as TransferCompletion;
           if (!completion || typeof completion !== "object") throw new Error("Invalid p2p transfer completion");
           return completion;
         },
@@ -540,6 +601,8 @@ export class P2PIntercomClient extends EventEmitter {
       };
       this.upsertPeer(connection.remotePeer, envelope.from);
       this.inboundRoutes.set(message.id, connection.remotePeer);
+      this.remember(this.inboundEndpoints, message.id, endpoint(envelope.from));
+      this.report(() => projectMessage(envelope.message, endpoint(envelope.from), endpoint(this.registration!), "receiver_received", envelope.manifest, this.telemetryContent));
       this.emit("message", envelope.from, message);
       await framed.write(encodeTransferJson(this.sign({ ok: true, transferId: envelope.transferId, ...(record ? { evidenceId: record.id } : { storedAt }) } satisfies PeerResponse)), { signal: controller.signal });
       await stream.close();
@@ -569,6 +632,10 @@ export class P2PIntercomClient extends EventEmitter {
       if (envelope.to !== this._sessionId) return { ok: false, reason: "Message addressed to another session" };
       this.upsertPeer(peerId, envelope.from);
       this.inboundRoutes.set(envelope.message.id, peerId);
+      this.remember(this.inboundEndpoints, envelope.message.id, endpoint(envelope.from));
+      const incomingMessage = envelope.message;
+      const incomingFrom = envelope.from;
+      if (this.registration) this.report(() => projectMessage(incomingMessage, endpoint(incomingFrom), endpoint(this.registration!), "receiver_received", undefined, this.telemetryContent));
       this.emit("message", envelope.from, envelope.message);
       return { ok: true };
     }
@@ -580,10 +647,15 @@ export class P2PIntercomClient extends EventEmitter {
       return { ok: true };
     }
     if (envelope.type === "receipt" && isSessionInfo(envelope.from) && isMessageReceipt(envelope.receipt)) {
+      const receipt = envelope.receipt;
+      const from = envelope.from;
+      const message = this.outboundMessages.get(receipt.messageId);
+      if (message && this.registration) this.report(() => ({ ...projectMessage(message, endpoint(this.registration!), endpoint(from), receipt.status), timestamp: receipt.timestamp }));
       this.emit("message_receipt", envelope.from, envelope.receipt);
       return { ok: true };
     }
     if (envelope.type === "control" && isSessionInfo(envelope.from) && isMessageControl(envelope.control)) {
+      if (this.registration) this.report({ messageId: envelope.control.messageId, from: endpoint(envelope.from), to: endpoint(this.registration), action: "cancel", timestamp: envelope.control.timestamp, status: "receiver_received" });
       this.emit("message_control", envelope.from, envelope.control);
       return { ok: true };
     }
