@@ -119,6 +119,25 @@ Press **Alt+I** or **Cmd+I** (macOS terminals that forward Command via the Kitty
 
 History uses existing session records (including other branches, inherited fork history, and pre-compaction entries), in local recording order. It refreshes every 250 ms while open and works offline with saved history. LIVE means following recorded messages, not proof of delivery or processing. Incoming messages appear once recorded by Pi; timestamps come from the original message/record and may reflect different clocks. Replies are identified by reply metadata or saved ask-waiter records, never inferred from wording. Attachments show names only; exchanges solely between other sessions are not included.
 
+## P2P Live Viewer
+
+Set `PI_INTERCOM_P2P_KEY` (at least 16 characters) and optional `PI_INTERCOM_SCOPE_ID` on all participants. P2P agents report telemetry **including message text by default**. Set `PI_INTERCOM_TELEMETRY=0` before starting Pi to disable reporting entirely, or `PI_INTERCOM_TELEMETRY_CONTENT=0` to report metadata without message text. Then run `npm run web` and open `http://127.0.0.1:8787/`. Override with `npm run web -- --port 9000`; from a project with the package installed, run `./node_modules/.bin/tsx ./node_modules/pi-intercom/p2p/viewer-web.ts --port 9000`. The viewer has no HTTP authentication and only accepts loopback clients, matching Host and same-origin requests. It never appears as an agent or message target.
+
+`createViewerServer(observer)` in `p2p/viewer-server.ts` returns an HTTP server. The caller starts/stops `TelemetryObserver` separately and listens on **127.0.0.1**:
+
+```ts
+import { TelemetryObserver } from "./p2p/telemetry.ts";
+import { createViewerServer } from "./p2p/viewer-server.ts";
+
+const observer = new TelemetryObserver();
+await observer.start();
+const server = createViewerServer(observer);
+server.listen(8787, "127.0.0.1"); // open http://127.0.0.1:8787/
+// On shutdown: server.close(); await observer.stop();
+```
+
+`GET /events` streams an initial snapshot and subsequent interaction updates via SSE (no JSON API). The server keeps the latest 1,000 interactions, including separate linked cancellation rows, with up to 16 status updates each; reconnecting receives a fresh snapshot. The UI marks truncated history and dropped sender telemetry. With content reporting enabled (the default), it transmits up to 16 KiB of each message's text over the authenticated telemetry stream and renders a safe Markdown subset in floating conversation windows. Drag agent cards to arrange them, drag empty space to pan, scroll to pan, and Ctrl/⌘+scroll or use toolbar buttons to zoom (25–200%) and fit the graph. Click an agent for all its retained interactions or a connection for both directions of that pair; move and resize multiple conversation windows independently. Keyboard arrows move a focused agent or window title, and resize a focused ↘ control; Escape closes a focused window. Layout and camera persist in this browser's localStorage; windows and message bodies do not. Reset layout restores the grid. The graph only shows agents in collected interactions. With `PI_INTERCOM_TELEMETRY_CONTENT=0`, it displays only endpoint metadata, action, status, IDs and attachment names/relative paths/counts. Attachment/file contents are never sent; message text itself may contain sensitive paths or secrets, so keep your key private. Live collection begins when a reporting agent connects; there is no backfill or persistence. Coverage is incomplete when neither endpoint reports (older/opted-out peers), and discovery reaches only peers on the existing LAN-local mDNS network. Keep this unauthenticated viewer on loopback; do not port-forward it to an untrusted network.
+
 ## How the P2P Layer Works
 
 ```mermaid
