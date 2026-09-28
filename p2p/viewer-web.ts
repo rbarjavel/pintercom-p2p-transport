@@ -11,7 +11,7 @@ const observer = new TelemetryObserver();
 const server = createViewerServer(observer);
 await observer.start();
 server.on("error", async (error) => { console.error(error); await observer.stop(); process.exitCode = 1; });
-server.listen(port, "127.0.0.1", () => console.log(`P2P viewer: http://127.0.0.1:${port}/`));
+server.listen(port, "0.0.0.0", () => console.log(`P2P viewer listening on 0.0.0.0:${port}; open http://<LAN-IP>:${port}/`));
 let stopping = false;
 async function stop() {
   if (stopping) return;

@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import { once } from "node:events";
 import { Script } from "node:vm";
 import { request } from "node:http";
+import { networkInterfaces } from "node:os";
 import { createViewerServer, type ViewerEvent } from "./viewer-server.ts";
 
 function event(messageId: string, status = "attempted"): ViewerEvent {
@@ -52,7 +53,7 @@ test("viewer serves local HTML, bounded snapshot and live interaction updates", 
     assert.deepEqual(rendered.children.map((child) => (child as { localName: string }).localName), ["h1", "p", "pre"]);
     assert.doesNotMatch(JSON.stringify(rendered), /"localName":"(script|img)"/);
     const pairFns = browserScript.slice(browserScript.indexOf("const laneKey ="), browserScript.indexOf("const label ="));
-    const keys = new Script(`${pairFns}\n({ laneKey, pairKey, pairMembers })`).runInNewContext({ JSON, Array });
+    const keys = new Script(`${pairFns}\n({ laneKey, pairKey, pairMembers, machineKey })`).runInNewContext({ JSON, Array });
     const a = keys.laneKey({ id: "agent", epoch: "one" });
     const restarted = keys.laneKey({ id: "agent", epoch: "two" });
     const b = keys.laneKey({ id: "other", epoch: "one" });
@@ -60,6 +61,26 @@ test("viewer serves local HTML, bounded snapshot and live interaction updates", 
     assert.equal(keys.pairKey(a, b), keys.pairKey(b, a));
     assert.equal(keys.pairMembers("broken").length, 0);
     assert.equal(keys.pairMembers(keys.pairKey(a, a)).length, 2);
+    assert.equal(keys.machineKey({ id: "agent", epoch: "one", hostname: "Host-A" }), keys.machineKey({ id: "agent", epoch: "one", hostname: "host-a" }));
+    assert.notEqual(keys.machineKey({ id: "agent", epoch: "one" }), keys.machineKey({ id: "other", epoch: "one" }));
+    const selection = browserScript.slice(browserScript.indexOf("  const peers=new Map(),pairs=new Map();"), browserScript.indexOf("  for (const key of positions.keys())"));
+    const visible = new Script(`${pairFns}\n${selection}\n({ peers: [...peers.keys()], pairs: [...pairs.keys()] })`).runInNewContext({
+      items: new Map([["message", { from: { id: "agent", epoch: "one", hostname: "host-a" }, to: { id: "other", epoch: "one" } }]]),
+      presence: new Map([[a, { peer: { id: "agent", epoch: "one" } }]]),
+    });
+    assert.deepEqual(Array.from(visible.peers), [a]);
+    assert.equal(visible.pairs.length, 0);
+    const layoutFns = browserScript.slice(browserScript.indexOf("function acceptPosition("), browserScript.indexOf("async function publishGroup("));
+    const testPositions = new Map([[a, [0, 0]], [b, [490, 0]], [restarted, [0, 120]]]);
+    const versions = new Map<string, number>();
+    const layout = new Script(`${layoutFns}\n({ moveGroup, acceptPosition })`).runInNewContext({
+      positions: testPositions, layoutVersions: versions, machineOf: new Map([[a, "host-a"], [b, "host-b"], [restarted, "host-a"]]), moving: null, paint: () => {},
+    });
+    layout.moveGroup("host-a", 25, -10);
+    assert.deepEqual(Array.from(testPositions.values(), p => Array.from(p)), [[25, -10], [490, 0], [25, 110]]);
+    layout.acceptPosition(a, [100, 100], 5);
+    layout.acceptPosition(a, [0, 0], 4);
+    assert.deepEqual(Array.from(testPositions.get(a)!), [100, 100]);
     const animationFn = browserScript.slice(browserScript.indexOf("function animateConnection("), browserScript.indexOf("function reconcile("));
     const classes = new Set<string>();
     const edge = { classList: { add: (name: string) => classes.add(name), remove: (name: string) => classes.delete(name) }, getBoundingClientRect: () => ({}) };
@@ -132,6 +153,7 @@ test("viewer serves local HTML, bounded snapshot and live interaction updates", 
       const insertion = await nextFrame();
       assert.equal(insertion.data.evicted, snapshot.data.interactions[1].id);
       observer.emit("event", { ...event("message-1001"), eventId: "restart", from: { id: "sender", epoch: "new-epoch", name: "Sender" } });
+      assert.equal((await nextFrame()).type, "layout");
       const restarted = await nextFrame();
       assert.notEqual(restarted.data.interaction.id, insertion.data.interaction.id, "restarted endpoints remain distinct despite duplicate names and IDs");
       observer.emit("status", { connected: true, reporter: { peerId: "remote-peer" } });
@@ -147,6 +169,93 @@ test("viewer serves local HTML, bounded snapshot and live interaction updates", 
   assert.equal(observer.listenerCount("event"), 0);
   assert.equal(observer.listenerCount("presence"), 0);
   assert.equal(observer.listenerCount("status"), 0);
+});
+
+test("viewer accepts LAN IP requests while rejecting host spoofing and cross-origin reads", async () => {
+  const observer = new EventEmitter();
+  const server = createViewerServer(observer);
+  server.listen(0, "0.0.0.0");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const root = `http://127.0.0.1:${address.port}`;
+  const withHost = (host: string) => new Promise<number>((resolve, reject) => {
+    request(root, { headers: { Host: host } }, reply => { reply.resume(); resolve(reply.statusCode!); }).on("error", reject).end();
+  });
+  try {
+    assert.equal((await fetch(root)).status, 200);
+    assert.equal(await withHost(`example.test:${address.port}`), 403);
+    const ip = Object.values(networkInterfaces()).flat().find((entry) => entry?.family === "IPv4" && !entry.internal)?.address;
+    if (ip) {
+      assert.equal((await fetch(`http://${ip}:${address.port}/`)).status, 200);
+      assert.equal(await withHost(`${ip}:${address.port}`), 403);
+      assert.equal((await fetch(`http://${ip}:${address.port}/events`, { headers: { Origin: "http://evil.example" } })).status, 403);
+    }
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+test("agent positions are shared across viewers and validated before broadcast", async () => {
+  const observer = new EventEmitter();
+  const server = createViewerServer(observer);
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const root = `http://127.0.0.1:${address.port}`;
+  const controller = new AbortController();
+  const updates = { method: "POST", headers: { "Content-Type": "application/json" } };
+  const key = JSON.stringify(["sender", "epoch"]);
+  function readFrames(response: Response) {
+    const reader = response.body!.getReader();
+    let buffer = "";
+    return async () => {
+      while (!buffer.includes("\n\n")) { const chunk = await reader.read(); assert.equal(chunk.done, false); buffer += new TextDecoder().decode(chunk.value); }
+      const end = buffer.indexOf("\n\n"), frame = buffer.slice(0, end);
+      buffer = buffer.slice(end + 2);
+      return { type: frame.match(/^event: (.*)$/m)?.[1], data: JSON.parse(frame.match(/^data: (.*)$/m)?.[1] ?? "null") };
+    };
+  }
+  try {
+    observer.emit("event", { ...event("shared"), from: { id: "sender", epoch: "epoch", hostname: "Host-A" }, to: { id: "receiver", epoch: "epoch", hostname: "Host-B" } });
+    observer.emit("event", { ...event("team"), from: { id: "sender", epoch: "epoch", hostname: "Host-A" }, to: { id: "teammate", epoch: "epoch", hostname: "host-a" } });
+    const first = readFrames(await fetch(`${root}/events`, { signal: controller.signal }));
+    const second = readFrames(await fetch(`${root}/events`, { signal: controller.signal }));
+    assert.deepEqual((await first()).data.layout, [[key, [0, 0]], [JSON.stringify(["receiver", "epoch"]), [490, 0]], [JSON.stringify(["teammate", "epoch"]), [0, 120]]]);
+    assert.equal((await second()).data.layout[0][0], key);
+    assert.equal((await fetch(`${root}/layout`, { ...updates, body: "not json" })).status, 400);
+    assert.equal((await fetch(`${root}/layout`, { ...updates, body: "x".repeat(1025) })).status, 413);
+    assert.equal((await fetch(`${root}/layout`, { ...updates, body: JSON.stringify({ key: "missing", x: 1, y: 2 }) })).status, 400);
+    assert.equal((await fetch(`${root}/layout`, { ...updates, body: JSON.stringify({ key, x: 1e9, y: 2 }) })).status, 400);
+    assert.equal((await fetch(`${root}/layout`, { ...updates, body: JSON.stringify({ key, x: null, y: 2 }) })).status, 400);
+    assert.equal((await fetch(`${root}/layout`, { method: "POST", body: JSON.stringify({ key, x: 1, y: 2 }) })).status, 415);
+    assert.equal((await fetch(`${root}/layout`, { ...updates, headers: { ...updates.headers, Origin: "http://evil.example" }, body: JSON.stringify({ key, x: 1, y: 2 }) })).status, 403);
+    assert.equal((await fetch(`${root}/layout`, { ...updates, body: JSON.stringify({ key, x: 99, y: -42 }) })).status, 204);
+    const singleUpdate = await first();
+    assert.equal(singleUpdate.type, "layout");
+    assert.deepEqual(singleUpdate.data.position, [99, -42]);
+    assert.equal(singleUpdate.data.key, key);
+    assert.deepEqual(await second(), singleUpdate);
+    const reconnect = readFrames(await fetch(`${root}/events`, { signal: controller.signal }));
+    assert.deepEqual((await reconnect()).data.layout[0], [key, [99, -42]]);
+    assert.equal((await fetch(`${root}/layout/group`, { ...updates, body: JSON.stringify({ machine: "other", dx: 50, dy: 20 }) })).status, 400);
+    assert.equal((await fetch(`${root}/layout/group`, { ...updates, body: JSON.stringify({ machine: "host-a", dx: 1e9, dy: 0 }) })).status, 400);
+    const groupMove = await fetch(`${root}/layout/group`, { ...updates, body: JSON.stringify({ machine: "host-a", dx: 50, dy: 20 }) });
+    assert.equal(groupMove.status, 200);
+    const moved = [[key, [149, -22]], [JSON.stringify(["teammate", "epoch"]), [50, 140]]];
+    const groupUpdate = await groupMove.json();
+    assert.deepEqual(groupUpdate.moved, moved);
+    assert.ok(groupUpdate.revision > singleUpdate.data.revision);
+    assert.deepEqual(await first(), { type: "layout", data: groupUpdate });
+    assert.deepEqual(await second(), { type: "layout", data: groupUpdate });
+    assert.equal((await fetch(`${root}/layout/reset`, { method: "POST" })).status, 204);
+    assert.deepEqual((await first()).data.positions, [[key, [0, 0]], [JSON.stringify(["receiver", "epoch"]), [490, 0]], [JSON.stringify(["teammate", "epoch"]), [0, 120]]]);
+    assert.deepEqual((await second()).data.positions[0], [key, [0, 0]]);
+  } finally {
+    controller.abort();
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
 });
 
 test("viewer snapshots current agent activity and clears disconnected reporters", async () => {

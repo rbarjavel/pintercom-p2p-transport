@@ -5,9 +5,9 @@ import { createHash } from "node:crypto";
 
 // Structural subset of TelemetryEvent; the observer's event payload supplies these fields.
 export type ViewerEvent = {
-  messageId: string; from: { id: string; epoch: string; name?: string };
-  to: { id: string; epoch: string; name?: string };
-  reporter: { id: string; epoch: string; peerId: string; name?: string }; eventId: string; sequence: number; version: 1;
+  messageId: string; from: { id: string; epoch: string; name?: string; hostname?: string };
+  to: { id: string; epoch: string; name?: string; hostname?: string };
+  reporter: { id: string; epoch: string; peerId: string; name?: string; hostname?: string }; eventId: string; sequence: number; version: 1;
   action: string; timestamp: number; status: string;
   replyTo?: string; retryOf?: string; supersedes?: string;
   body?: string; bodyTruncated?: boolean;
@@ -33,13 +33,16 @@ type Interaction = Pick<ViewerEvent, "messageId" | "from" | "to" | "action" | "t
   updates: Update[];
 };
 
-/** Caller owns observer.start/stop and server.listen; listen on 127.0.0.1, not a public interface. */
+/** Caller owns observer.start/stop and server.listen; LAN access is unauthenticated and can expose message text. */
 export function createViewerServer(observer: EventEmitter): Server {
   const interactions = new Map<string, Interaction>();
   const seen = new Map<string, Set<string>>();
   const clients = new Set<ServerResponse>();
   const reporters = new Set<string>();
   const presence = new Map<string, { peer: ViewerEvent["from"]; active: boolean }>();
+  const layout = new Map<string, [number, number]>();
+  const machineByKey = new Map<string, string>();
+  let layoutRevision = 0;
   let truncated = false;
   let partial = false;
   const send = (response: ServerResponse, name: string, data: unknown) => {
@@ -50,6 +53,24 @@ export function createViewerServer(observer: EventEmitter): Server {
   };
   const broadcast = (name: string, data: unknown) => {
     for (const client of clients) send(client, name, data);
+  };
+  const laneKey = (peer: ViewerEvent["from"]) => JSON.stringify([peer.id, peer.epoch]);
+  const machineKey = (peer: ViewerEvent["from"]) => peer.hostname?.trim().toLowerCase() || `unknown:${laneKey(peer)}`;
+  const place = (peer: ViewerEvent["from"]) => {
+    const key = laneKey(peer), machine = machineKey(peer);
+    if (!machineByKey.has(key) || peer.hostname?.trim()) machineByKey.set(key, machine);
+    if (layout.has(key)) return;
+    const members = [...layout].filter(([id]) => machineByKey.get(id) === machine);
+    let position: [number, number];
+    if (members.length) position = [Math.min(...members.map(([, [x]]) => x)), Math.max(...members.map(([, [, y]]) => y)) + 120];
+    else position = [layout.size ? Math.max(...[...layout.values()].map(([x]) => x + 190)) + 300 : 0, 0];
+    layout.set(key, position);
+    broadcast("layout", { key, position, revision: ++layoutRevision });
+  };
+  const pruneLayout = () => {
+    const alive = new Set([...presence.values()].map(({ peer }) => laneKey(peer)));
+    for (const item of interactions.values()) { alive.add(laneKey(item.from)); alive.add(laneKey(item.to)); }
+    for (const key of layout.keys()) if (!alive.has(key)) { layout.delete(key); machineByKey.delete(key); }
   };
   const onEvent = (event: ViewerEvent) => {
     const originalId = JSON.stringify([event.from.id, event.from.epoch, event.messageId]);
@@ -77,17 +98,22 @@ export function createViewerServer(observer: EventEmitter): Server {
     ids.add(eventKey);
     if (ids.size > 128) ids.delete(ids.values().next().value!);
     seen.set(id, ids);
+    if (event.from.hostname && !interaction.from.hostname) interaction.from = event.from;
+    if (event.to.hostname && !interaction.to.hostname) interaction.to = event.to;
     if (event.action !== "receipt" && interaction.action === "receipt") interaction.action = event.action;
     if (event.artifacts) interaction.artifacts = event.artifacts;
     if (event.body !== undefined) { interaction.body = event.body; interaction.bodyTruncated = event.bodyTruncated; }
     interaction.updates.push({ eventId: event.eventId, action: event.action, status: event.status, timestamp: event.timestamp, sequence: event.sequence, reporter: event.reporter.name ?? event.reporter.id });
     if ((statusRank[event.status] ?? 0) >= (statusRank[interaction.status] ?? 0)) interaction.status = event.status;
     if (interaction.updates.length > MAX_UPDATES) interaction.updates.shift();
+    place(event.from); place(event.to);
+    if (evicted) pruneLayout();
     broadcast("interaction", { interaction, evicted, truncated, partial });
   };
   const onPresence = (update: { reporter: ViewerEvent["reporter"]; active: boolean }) => {
     const { peerId, ...peer } = update.reporter;
     presence.set(peerId, { peer, active: update.active });
+    place(peer);
     broadcast("presence", { peer, active: update.active, connected: true });
   };
   const onStatus = (status: { partial?: boolean; dropped?: number; connected?: boolean; reporter?: { peerId: string }; peerId?: string }) => {
@@ -96,7 +122,7 @@ export function createViewerServer(observer: EventEmitter): Server {
     if (status.connected === false && status.peerId) {
       reporters.delete(status.peerId);
       const old = presence.get(status.peerId);
-      if (old) { presence.delete(status.peerId); broadcast("presence", { ...old, active: false, connected: false }); }
+      if (old) { presence.delete(status.peerId); pruneLayout(); broadcast("presence", { ...old, active: false, connected: false }); }
     }
     broadcast("status", { ...status, connectedReporters: reporters.size, truncated, partial });
   };
@@ -107,14 +133,51 @@ export function createViewerServer(observer: EventEmitter): Server {
   const server = createServer(async (request, response) => {
     const port = (server.address() as { port?: number } | null)?.port;
     const host = request.headers.host?.toLowerCase();
-    const remote = request.socket.remoteAddress;
-    if (!port || !host || ![`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`].includes(host)
-      || !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote ?? "")
+    const local = request.socket.localAddress;
+    // Only accept an IP literal for the interface reached (or localhost on loopback), not a rebinding DNS name.
+    if (!port || !host || !local || (host !== `${local}:${port}` && !(local === "127.0.0.1" && host === `localhost:${port}`))
       || (request.headers.origin && request.headers.origin.toLowerCase() !== `http://${host}`)) {
       response.writeHead(403).end("Forbidden"); return;
     }
-    if (request.method !== "GET") { response.writeHead(405, { Allow: "GET" }).end(); return; }
     const path = request.url?.split("?", 1)[0];
+    if ((path === "/layout" || path === "/layout/group") && request.method === "POST") {
+      if (request.headers["content-type"] !== "application/json") { response.writeHead(415).end("Expected JSON"); return; }
+      try {
+        let body = "";
+        for await (const chunk of request) { body += chunk; if (body.length > 1024) { response.writeHead(413).end("Layout update too large"); return; } }
+        const data = JSON.parse(body) as Record<string, unknown>;
+        if (path === "/layout/group") {
+          if (typeof data.machine !== "string" || typeof data.dx !== "number" || typeof data.dy !== "number" || !Number.isFinite(data.dx) || !Number.isFinite(data.dy)) throw new Error("Invalid group movement");
+          const moved: [string, [number, number]][] = [];
+          const dx = data.dx, dy = data.dy;
+          for (const [key, [x, y]] of layout) if (machineByKey.get(key) === data.machine) moved.push([key, [x + dx, y + dy]]);
+          if (!moved.length || moved.some(([, position]) => position.some((coordinate) => !Number.isFinite(coordinate) || Math.abs(coordinate) > 1_000_000))) throw new Error("Invalid group movement");
+          for (const [key, position] of moved) layout.set(key, position);
+          const revision = ++layoutRevision;
+          broadcast("layout", { moved, revision });
+          response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" }).end(JSON.stringify({ moved, revision }));
+        } else {
+          if (typeof data.key !== "string" || !layout.has(data.key) || typeof data.x !== "number" || typeof data.y !== "number" || !Number.isFinite(data.x) || !Number.isFinite(data.y) || Math.abs(data.x) > 1_000_000 || Math.abs(data.y) > 1_000_000) throw new Error("Invalid layout update");
+          const position: [number, number] = [data.x, data.y];
+          layout.set(data.key, position);
+          broadcast("layout", { key: data.key, position, revision: ++layoutRevision });
+          response.writeHead(204).end();
+        }
+      } catch { response.writeHead(400).end("Invalid layout update"); }
+      return;
+    }
+    if (path === "/layout/reset" && request.method === "POST") {
+      const groups = new Map<string, { x: number; count: number }>();
+      for (const key of layout.keys()) {
+        const machine = machineByKey.get(key) ?? `unknown:${key}`;
+        let group = groups.get(machine);
+        if (!group) { group = { x: groups.size * 490, count: 0 }; groups.set(machine, group); }
+        layout.set(key, [group.x, group.count++ * 120]);
+      }
+      broadcast("layout", { positions: [...layout], revision: ++layoutRevision });
+      response.writeHead(204).end(); return;
+    }
+    if (request.method !== "GET") { response.writeHead(405, { Allow: "GET, POST" }).end(); return; }
     if (path === "/events") {
       if (clients.size >= MAX_CLIENTS) { response.writeHead(503).end("Too many viewers"); return; }
       response.writeHead(200, {
@@ -125,7 +188,7 @@ export function createViewerServer(observer: EventEmitter): Server {
       });
       clients.add(response);
       response.on("close", () => clients.delete(response));
-      let snapshot = { interactions: [...interactions.values()], presence: [...presence.values()], connectedReporters: reporters.size, truncated, partial };
+      let snapshot = { interactions: [...interactions.values()], presence: [...presence.values()], layout: [...layout], layoutRevision, connectedReporters: reporters.size, truncated, partial };
       if (Buffer.byteLength(JSON.stringify(snapshot)) > MAX_BUFFER - 1024) {
         // ponytail: trim snapshot artifact descriptors before an oversized write; totals and omitted counts remain accurate.
         snapshot = { ...snapshot, interactions: snapshot.interactions.map((interaction) => {
