@@ -46,6 +46,7 @@ function resolvePendingSender(pending: IntercomContext[], to: string): IntercomC
 
 export class ReplyTracker {
   private readonly pendingAsks = new Map<string, IntercomContext>();
+  private readonly cancelledAsks = new Map<string, IntercomContext>();
   private readonly pendingTurnContexts: IntercomContext[] = [];
   private currentTurnContext: IntercomContext | null = null;
 
@@ -74,6 +75,7 @@ export class ReplyTracker {
 
   reset(): void {
     this.pendingAsks.clear();
+    this.cancelledAsks.clear();
     this.pendingTurnContexts.length = 0;
     this.currentTurnContext = null;
   }
@@ -85,7 +87,10 @@ export class ReplyTracker {
       const target = this.pendingAsks.get(options.replyTo)
         ?? (this.currentTurnContext?.message.id === options.replyTo ? this.currentTurnContext : undefined);
       if (!target) {
-        throw new Error(`No active message with ID "${options.replyTo}"`);
+        const cancelled = this.cancelledAsks.get(options.replyTo);
+        throw new Error(cancelled
+          ? `Ask "${options.replyTo}" was cancelled by ${cancelled.from.name || cancelled.from.id}; do not retry it with send`
+          : `No active message with ID "${options.replyTo}"`);
       }
       if (options.to && !matchesPendingSender(target, options.to)) {
         throw new Error(`Message "${options.replyTo}" is not from "${options.to}"`);
@@ -113,13 +118,19 @@ export class ReplyTracker {
   }
 
   findUniquePendingAskFrom(to: string, now = Date.now()): IntercomContext | null {
-    const candidates = Array.from(this.pendingAsks.values()).filter((context) => {
-      if (now - context.receivedAt > this.askTimeoutMs) {
-        return false;
-      }
-      return context.from.id === to || context.from.name?.toLowerCase() === to.toLowerCase();
-    });
+    this.pruneExpired(now);
+    const matchesSender = (context: IntercomContext) =>
+      context.from.id === to || context.from.name?.toLowerCase() === to.toLowerCase();
+    if (Array.from(this.cancelledAsks.values()).some(matchesSender)) return null;
+    const candidates = Array.from(this.pendingAsks.values()).filter((context) =>
+      now - context.receivedAt <= this.askTimeoutMs && matchesSender(context));
     return candidates.length === 1 ? candidates[0]! : null;
+  }
+
+  cancelPendingAsk(messageId: string): void {
+    const context = this.pendingAsks.get(messageId);
+    if (context) this.cancelledAsks.set(messageId, context);
+    this.dismissPendingAsk(messageId);
   }
 
   markReplied(replyTo: string): void {
@@ -145,9 +156,10 @@ export class ReplyTracker {
 
   private pruneExpired(now: number): void {
     for (const [messageId, context] of this.pendingAsks) {
-      if (now - context.receivedAt > this.askTimeoutMs) {
-        this.dismissPendingAsk(messageId);
-      }
+      if (now - context.receivedAt > this.askTimeoutMs) this.dismissPendingAsk(messageId);
+    }
+    for (const [messageId, context] of this.cancelledAsks) {
+      if (now - context.receivedAt > this.askTimeoutMs) this.cancelledAsks.delete(messageId);
     }
   }
 }

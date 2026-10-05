@@ -16,6 +16,18 @@ async function withAgentDir<T>(agentDir: string, fn: () => T | Promise<T>): Prom
   }
 }
 
+test("history sharing defaults on, accepts opt-out and rejects non-booleans", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-watch-config-"));
+  try {
+    await withAgentDir(root, () => assert.equal(loadConfig().watchEnabled, true));
+    mkdirSync(join(root, "intercom"), { recursive: true });
+    writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ watchEnabled: false }));
+    await withAgentDir(root, () => assert.equal(loadConfig().watchEnabled, false));
+    writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ watchEnabled: "false" }));
+    await withAgentDir(root, () => assert.throws(() => loadConfig(), /watchEnabled.*boolean/));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("getConfigPath uses the centralized intercom runtime directory", () => {
   assert.equal(getConfigPath("/tmp/pi-agent/intercom"), join("/tmp/pi-agent", "intercom", "config.json"));
 });

@@ -1,4 +1,5 @@
 import { EventEmitter } from "events";
+import { WATCH_FEATURE, WATCH_TIMEOUT, validateWatchRequest, validWatchResult, watchError, watchDeadline, jsonBytes, type WatchRequest, type WatchResult, type WatchProvider } from "../watch.ts";
 import net from "net";
 import { randomUUID } from "crypto";
 import { writeMessage, createMessageReader } from "./framing.ts";
@@ -64,6 +65,43 @@ function connectToBrokerTarget(target: BrokerConnectTarget): net.Socket {
 }
 
 export class IntercomClient extends EventEmitter {
+  private watchProvider?: WatchProvider;
+  private inboundWatches = new Map<string, AbortController>();
+  private pendingWatches = new Map<string, { resolve: (r: WatchResult) => void; reject: (e: Error) => void }>();
+  endpointEpoch?: string;
+  setWatchProvider(provider?: WatchProvider): void {
+    this.watchProvider = provider;
+    for (const controller of this.inboundWatches.values()) controller.abort(new Error("replaced"));
+    this.inboundWatches.clear();
+  }
+  async watch(to: string, request: WatchRequest, signal?: AbortSignal): Promise<WatchResult> {
+    validateWatchRequest(request);
+    const socket = this.requireActiveSocket();
+    if (!this.supportsFeature(WATCH_FEATURE)) return watchError("unsupported");
+    if (this.pendingWatches.size >= 8) return watchError("busy");
+    const target = (await this.listSessions()).find(s => s.id === to);
+    signal?.throwIfAborted();
+    if (!target) return watchError("not_found");
+    if (target.id === this._sessionId) return watchError("self_target");
+    if (target.watchEnabled === undefined) return watchError("unsupported");
+    if (!target.watchEnabled) return watchError("disabled");
+    if (this.pendingWatches.size >= 8) return watchError("busy");
+    if (this.socket !== socket || !this.isConnected()) return watchError("disconnected");
+    const requestId = randomUUID();
+    const envelope = { type: "watch_request", requestId, to, targetEpoch: target.endpointEpoch, request };
+    if (jsonBytes(envelope) > 8192) return watchError("invalid_request");
+    try {
+      const result = await watchDeadline(() => new Promise<WatchResult>((resolve, reject) => {
+        this.pendingWatches.set(requestId, { resolve, reject });
+        writeMessage(socket, envelope);
+      }), WATCH_TIMEOUT, signal);
+      if (!validWatchResult(result, request)) return watchError("invalid_response");
+      if (!("error" in result) && (result.target.id !== target.id || result.target.endpointEpoch !== target.endpointEpoch)) return watchError("stale_target");
+      return result;
+    } finally {
+      if (this.pendingWatches.delete(requestId) && !socket.destroyed) writeMessage(socket, { type: "watch_cancel", requestId });
+    }
+  }
   private socket: net.Socket | null = null;
   private _sessionId: string | null = null;
   private _features = new Set<string>();
@@ -76,6 +114,9 @@ export class IntercomClient extends EventEmitter {
   private livenessInFlight = false;
 
   private failPending(error: Error): void {
+    this.setWatchProvider(undefined);
+    for (const pending of this.pendingWatches.values()) pending.reject(error);
+    this.pendingWatches.clear();
     for (const pending of this.pendingSends.values()) {
       pending.reject(error);
     }
@@ -331,6 +372,7 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid registered features");
         }
 
+        this.endpointEpoch = typeof brokerMessage.endpointEpoch === "string" ? brokerMessage.endpointEpoch : undefined;
         this._sessionId = brokerMessage.sessionId;
         this._features = new Set((brokerMessage.features as string[] | undefined) ?? []);
         const registered: BrokerMessage = {
@@ -343,6 +385,37 @@ export class IntercomClient extends EventEmitter {
         break;
       }
 
+      case "watch_response": {
+        if (typeof brokerMessage.requestId !== "string" || !validWatchResult(brokerMessage.result)) throw new Error("Invalid watch response");
+        const pending = this.pendingWatches.get(brokerMessage.requestId);
+        this.pendingWatches.delete(brokerMessage.requestId);
+        pending?.resolve(brokerMessage.result);
+        break;
+      }
+      case "watch_cancel": {
+        if (typeof brokerMessage.requestId !== "string") throw new Error("Invalid watch cancellation");
+        this.inboundWatches.get(brokerMessage.requestId)?.abort(new Error("cancelled"));
+        this.inboundWatches.delete(brokerMessage.requestId);
+        break;
+      }
+      case "watch_request": {
+        const { requestId, request } = brokerMessage;
+        if (typeof requestId !== "string" || requestId.length > 128) throw new Error("Invalid watch request");
+        validateWatchRequest(request);
+        const socket = this.requireActiveSocket();
+        const provider = this.watchProvider;
+        if (!provider || this.inboundWatches.size >= 32) {
+          writeMessage(socket, { type: "watch_response", requestId, result: watchError(provider ? "busy" : "disabled") });
+          break;
+        }
+        if (this.inboundWatches.has(requestId)) throw new Error("Duplicate watch request");
+        const controller = new AbortController();
+        this.inboundWatches.set(requestId, controller);
+        void watchDeadline(s => provider(request, s), WATCH_TIMEOUT, controller.signal).catch(error => watchError(error instanceof Error ? error.message : "failed")).then(result => {
+          if (this.socket === socket && this.watchProvider === provider && !controller.signal.aborted && !socket.destroyed) writeMessage(socket, { type: "watch_response", requestId, result: validWatchResult(result, request) ? result : watchError("invalid_response") });
+        }).finally(() => { if (this.inboundWatches.get(requestId) === controller) this.inboundWatches.delete(requestId); });
+        break;
+      }
       case "sessions": {
         const { requestId, sessions } = brokerMessage;
         if (typeof requestId !== "string" || !Array.isArray(sessions) || !sessions.every(isSessionInfo)) {

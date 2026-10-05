@@ -3,8 +3,10 @@ name: pi-intercom
 description: |
   Streamline session-to-session coordination with pi-intercom. Send messages,
   delegate tasks, and coordinate work across multiple pi sessions on the same
-  machine. Use for planner-worker workflows, cross-session context sharing,
-  and real-time collaboration between sessions.
+  machine. Also use when asked "Tell me what <agent> is doing", "What is he
+  working on?", "What problem did <agent> encounter?", or to get another agent's
+  context without interacting with it. Use watch for these read-only requests;
+  use messaging for planner-worker coordination and collaborative workflows.
 ---
 
 # Pi Intercom Skill
@@ -19,6 +21,8 @@ This skill covers how to handle those orchestrator-side escalations.
 
 ## When to Use
 
+- **Silent context gathering**: "Tell me what worker is doing", "What is he working on?", "What problems did reviewer encounter?" — inspect recorded history with `watch`, without messaging or waking the agent
+- **Workflow context**: Before continuing work, making a decision, or handing off a task, read another agent's recorded findings and failures without asking it for a status report
 - **Task delegation**: Split work between a planner session and worker sessions
 - **Context handoffs**: Send findings from a research session to an execution session
 - **Clarification loops**: Worker asks questions, planner answers, work continues
@@ -240,6 +244,162 @@ it as a `contact_supervisor` escalation. A subagent may use regular `intercom` f
 peer coordination, including peers in other directories, but owner decisions and
 new visible project panes should go through the supervisor.
 
+## Watch: Read Recorded History Without Messaging
+
+### Trigger: Ask What Another Agent Is Doing
+
+Treat these requests as a **read-only context workflow**, not a request to contact
+the agent:
+
+- "Tell me what worker is doing."
+- "What is he working on?"
+- "What problem did api-worker encounter?"
+- "Get reviewer’s context before we continue, without interrupting him."
+
+1. Call `intercom({ action: "list" })` to resolve the named agent or pronoun to a
+   live peer. Prefer its short ID if names are duplicated; never target yourself.
+   If the referent remains ambiguous, ask the user which peer they mean.
+2. Call `watch` for its latest recorded activity. For a specific problem or topic,
+   pass `query`; follow `olderCursor` if the relevant context predates the page.
+3. Read truncated decisive events with `eventId` and `nextOffset` as needed.
+4. Summarize the task, latest recorded progress, encountered problems, and next
+   step **only where the history supports them**. Say "last recorded activity"
+   rather than inventing a current intention; distinguish a past failure from an
+   unresolved blocker. State any gaps in the available history.
+
+Do **not** use `send`, `ask`, or `reply` to obtain this context. Do not launch a
+session or fall back to messaging if watch is unavailable: report that limitation.
+This workflow can supply context for your own next action without involving the
+other agent at all.
+
+**Example — user asks "What problem did api-worker encounter?"**
+
+```typescript
+intercom({ action: "list" })
+// → api-worker (7a3f), thinking
+intercom({ action: "watch", to: "7a3f", query: "encountered failures, errors and blockers" })
+// Use returned cursors/event IDs if more context is needed; no message is sent.
+```
+
+If the recorded history shows a failed test followed by a successful rerun, answer:
+"api-worker was fixing API retries. It encountered a timeout test failure, then
+recorded a successful rerun. The latest recorded activity is updating the patch;
+I found no later evidence of a remaining blocker."
+
+### Calls and Examples
+
+`watch` reads a connected peer's current-branch transcript. It is a pull read on
+either transport — not a message, model wake, subscription, telemetry request, or
+session launcher — so it never interrupts the target. Use it to see what another
+session actually did before you send work, or to follow its progress silently.
+
+```typescript
+intercom({ action: "watch", to: "worker" })                                  // latest page
+intercom({ action: "watch", to: "worker", cursor: "<olderCursor>" })         // next page back
+intercom({ action: "watch", to: "worker", direction: "newer", cursor: "<newerCursor>" }) // poll forward
+intercom({ action: "watch", to: "worker", query: "the failing test" })       // system_one relevance filter
+intercom({ action: "watch", to: "worker", eventId: "<event ID>", offset: 0 }) // full text of one event
+```
+
+**Example — read the latest page.** The default call returns chronological events
+(up to 20 / 12 KiB) plus cursors for both directions:
+
+```typescript
+intercom({ action: "watch", to: "worker" })
+```
+
+```text
+Watch worker (sess-7a3f) — tool:edit — endpoint e1
+Page: 3 event(s), chronological — hasOlder=true hasNewer=false truncated=false — generation gk9Q
+Filter: none — no query was sent, so system_one was NOT called (pass query to enable relevance filtering)
+olderCursor: YWJj...
+newerCursor: ZGVm...
+1. [user] 2026-10-05T10:00:01.000Z id=gk9Q:0
+   Add retry logic to the API client.
+2. [tool_call] 2026-10-05T10:00:04.000Z id=gk9Q:1 toolCallId=call_1
+   read {"path":"src/api/client.ts"}
+3. [tool_result] 2026-10-05T10:00:04.120Z id=gk9Q:2 toolCallId=call_1
+   export async function fetchUser(...) { ... }
+```
+
+`hasNewer=false` means this is the tail. Feed `olderCursor` back to page into the
+past (snapshot-anchored), or `newerCursor` with `direction: "newer"` to pick up
+events appended after this page. An empty live tail still returns a usable
+cursor, so poll again:
+
+```typescript
+intercom({ action: "watch", to: "worker", direction: "newer", cursor: page.newerCursor })
+// → 0 events, hasNewer=false, fresh newerCursor (idle — poll later)
+```
+
+**Example — read one event in full.** Previews are capped at 2 KiB. Fetch the rest
+by `eventId`, following byte-based `nextOffset` (a UTF-8 boundary) until absent:
+
+```typescript
+let offset = 0;
+do {
+  const chunk = await intercom({ action: "watch", to: "worker", eventId: "gk9Q:2", offset });
+  offset = chunk.nextOffset ?? -1; // undefined = end of text
+} while (offset >= 0);
+```
+
+Do not combine `eventId` with cursor, direction or query. Without a cursor, either
+direction starts with the latest page. A tiny metadata budget can return
+`budget_too_small`; increase `maxBytes`. Tree/session/endpoint replacement yields
+`stale_cursor`; ordinary appends/compaction do not. Re-list before reusing a
+target ID.
+
+What is included: history predating the read and normal compaction, recorded tool
+calls and completed results. No abandoned branches or partial streams are
+exposed. System/thinking content and opaque details are excluded; images are
+placeholders. Nested metadata appears only if Pi saved it, with omission
+indicators; nested results are not recorded by Pi.
+
+**Example — filter by relevance.** Passing `query` makes the watcher launch one
+batched `system_one` `noul` judgment — through normal permission hooks — over at
+most 40 events/32 KiB of previews and keep only events with `p >= 0.5`, each
+labeled with its probability:
+
+```typescript
+intercom({ action: "watch", to: "worker", query: "the failing test" })
+```
+
+```text
+Filter: system_one LAUNCHED — tool=system_one type=noul candidates=20 query="the failing test" model=unreported kept=2/20 windowExhausted=false (approximate, preview-based; p>=0.5 kept)
+...
+5. [tool_result] p=0.91 2026-10-05T10:04:12.000Z id=gk9Q:11 toolCallId=call_4 (truncated)
+   FAIL src/api/client.test.ts ...
+```
+
+**`query` is the relevance filter switch** (nonblank, ≤2,000 characters). Without
+it, `system_one` is **never** called and the whole window is returned; a watch is
+not implicitly filtered. Reading the transcript and then calling `system_one`
+yourself to judge it is a different thing: that produces judgments, not a
+relevance selection.
+
+Read the `Filter:` line rather than assuming:
+
+- `filter.mode: "filtered"` — the call was launched. `filter.launched` records it
+  (`tool=system_one`, `type=noul`, `candidates`), plus `query`, `model` when
+  reported, `examined`/`returned` and `windowExhausted`. Returned events carry
+  `score` (their probability).
+- `filter.mode: "fallback"` — no model work happened. `filter.reason` says why
+  (tool absent/denied, invalid answers, provider failure, or the 15-second model
+  timeout) and the unfiltered window is returned instead.
+- `Filter: none` / no `filter` block — no `query` was sent.
+
+Matching is approximate, preview-based, and not an exhaustive history search;
+no matches can still advance the scan cursor. No alternative model, lexical
+fallback, or automatic activation is used. Cancellation stops the read.
+
+**Sensitive data:** history sharing defaults to enabled; targets may set
+`"watchEnabled": false` in intercom config and restart. User input/tool output
+may contain secrets and are not automatically redacted. Existing authenticated
+trust scopes—not an extra permission prompt—are the access boundary. Older peers
+return `unsupported`, opted-out peers `disabled`, and excess concurrent reads
+`busy` (eight/requester, 32/target; 10-second transport timeout). No stopped-session
+or filesystem browsing is supported.
+
 ## Key Differences
 
 | Action | Behavior | Use When |
@@ -250,6 +410,7 @@ new visible project panes should go through the supervisor.
 | `pending` | Lists unresolved inbound asks | You need to see who is waiting before replying |
 | `list` | Returns all sessions with live status | You need to discover targets or choose an idle peer |
 | `status` | Returns your connection state | Troubleshooting |
+| `watch` | Pulls a bounded recorded-history page without messaging or waking | Inspect a connected peer's work |
 
 ## Visible Peer Sessions
 
@@ -362,6 +523,10 @@ In the prompt editor, type `@@` at the start of a line or after whitespace to au
 ## Error Handling
 
 ### Common Errors and Solutions
+
+**"Ask was cancelled" / "No active message"**
+
+The displayed message may have been injected before its sender cancelled the blocking ask. Do not retry the acknowledgement with `send`: it may be unrelated or could target another pending ask. Use `pending` to find requests that are still active.
 
 **"Already waiting for a reply"**
 ```typescript

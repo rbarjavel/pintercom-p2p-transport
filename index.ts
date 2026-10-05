@@ -1,4 +1,5 @@
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { WatchHistory, filterWatch, formatWatchResult, validateWatchRequest, watchError, type WatchRequest, type WatchToolContext } from "./watch.ts";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import { hostname, type as osType } from "node:os";
@@ -6,6 +7,7 @@ import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { IntercomClient, type SendResult } from "./broker/client.ts";
 import type { P2PIntercomClient } from "./p2p/client.ts";
+import { projectTodos, replayTodos, type TodoSnapshot } from "./p2p/todo.ts";
 import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
 import { SessionListOverlay } from "./ui/session-list.ts";
 import { createSessionAutocompleteProvider } from "./session-autocomplete.ts";
@@ -137,7 +139,7 @@ function getErrorMessage(error: unknown): string {
 
 function isIntercomSkillRead(input: unknown, cwd: string): boolean {
   if (!input || typeof input !== "object") return false;
-  const inputPath = Reflect.get(input, "path");
+  const inputPath = (input as { path?: unknown }).path;
   if (typeof inputPath !== "string") return false;
   const normalizedPath = inputPath.startsWith("@") ? inputPath.slice(1) : inputPath;
   try {
@@ -307,7 +309,7 @@ function interviewOptionLabel(option: unknown): string {
   return typeof option === "string" ? option : (option as { label: string }).label;
 }
 
-function interviewExampleValue(question: SupervisorInterviewQuestion): unknown {
+function interviewExampleValue(question: SupervisorInterviewQuestion): string | string[] {
   if (question.type === "multi") {
     return question.options?.slice(0, 2).map(interviewOptionLabel) ?? [];
   }
@@ -619,6 +621,7 @@ function getNamePollMs(): number {
 }
 export default function piIntercomExtension(pi: ExtensionAPI) {
   let client: ActiveIntercomClient | null = null;
+  let watchHistory = new WatchHistory();
   const config: IntercomConfig = loadConfig();
   const askTimeoutMs = getAskTimeoutMs();
   const localExtensions = new Map<string, {
@@ -703,11 +706,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
   }
   function handleMessageControl(control: MessageControl): void {
-    replyTracker.dismissPendingAsk(control.messageId);
     if (control.action === "cancel") {
+      replyTracker.cancelPendingAsk(control.messageId);
       emitMessageReceipt(control.messageId, "cancellation_requested", "message may already be injected or processed");
       return;
     }
+    replyTracker.dismissPendingAsk(control.messageId);
     emitMessageReceipt(control.messageId, "superseded", control.supersededBy ? `superseded by ${control.supersededBy}` : undefined);
   }
   function latestDeliveryState(messageId: string | null, fallback: string): string {
@@ -919,6 +923,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const sshSystem = process.env.PI_SSH_SYSTEM?.trim();
     return {
       ...identity,
+      watchEnabled: config.watchEnabled,
       cwd: liveContext.cwd,
       model: currentModel,
       hostname: sshHostname || hostname(),
@@ -956,7 +961,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     return result;
   }
 
-  function syncPresenceIdentity(sessionId: string): void {
+  function syncPresenceIdentity(_sessionId: string): void {
     if (!client || !getLiveContext()) {
       return;
     }
@@ -990,6 +995,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return;
     }
     process.env[INTERCOM_SESSION_ID_ENV] = previousIntercomSessionId;
+  }
+  let todoSnapshot: TodoSnapshot | undefined;
+  const hasTodoPackage = () => pi.getAllTools().some(tool => tool.name === "todo" && /@juicesharp\/rpiv-todo(?:\/|$)/.test(tool.sourceInfo.path ?? ""));
+  function shareTodos(snapshot: TodoSnapshot): void {
+    todoSnapshot = snapshot;
+    if (client && "updateTodos" in client) client.updateTodos(snapshot);
   }
   function syncPresenceStatus(): void {
     if (!client || !currentSessionId || !getLiveContext()) {
@@ -1460,7 +1471,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (reconnectPromise && reconnectPromiseGeneration === generationAtStart) {
       return reconnectPromise;
     }
-    const nextReconnectPromise = (async () => {
+    let nextReconnectPromise: Promise<ActiveIntercomClient> | undefined;
+    nextReconnectPromise = (async () => {
       const nextClient: ActiveIntercomClient = config.transport === "p2p"
         ? new (await import("./p2p/client.ts")).P2PIntercomClient()
         : new IntercomClient();
@@ -1474,6 +1486,17 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           throw new Error("Intercom runtime no longer active");
         }
         client = nextClient;
+        watchHistory = new WatchHistory();
+        const history = watchHistory;
+        nextClient.setWatchProvider(config.watchEnabled ? (request, signal) => {
+          signal.throwIfAborted();
+          const live = getLiveContext(contextAtStart, generationAtStart);
+          if (!live || client !== nextClient || history !== watchHistory) return watchError("stale_target");
+          return history.page(live.sessionManager.getBranch(), live.sessionManager.getSessionId(), {
+            ...buildRegistration(), id: nextClient.sessionId!, endpointEpoch: nextClient.endpointEpoch,
+          }, request);
+        } : undefined);
+        if (todoSnapshot && "updateTodos" in nextClient) nextClient.updateTodos(todoSnapshot);
         reconnectAttempt = 0;
         return nextClient;
       } catch (error) {
@@ -1624,6 +1647,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       void previousClient.disconnect().catch(() => undefined);
     }
     runtimeContext = ctx;
+    todoSnapshot = hasTodoPackage() && process.env.PI_INTERCOM_TELEMETRY_CONTENT !== "0" ? replayTodos(ctx.sessionManager.getBranch()) : undefined;
     currentSessionId = ctx.sessionManager.getSessionId();
     currentIntercomSessionId = resolveConfiguredIntercomSessionId(currentSessionId, config);
     publishIntercomSessionId(currentIntercomSessionId);
@@ -1756,7 +1780,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     ctx.ui?.addAutocompleteProvider?.((current) => createSessionAutocompleteProvider(current, async (signal) => {
       if (signal.aborted || !client?.isConnected()) return undefined;
       const sessions = await client.listSessions();
-      return signal.aborted ? undefined : { selfId: client.sessionId, sessions };
+      return signal.aborted ? undefined : { selfId: client.sessionId ?? undefined, sessions };
     }));
   });
   
@@ -1783,10 +1807,17 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       client = null;
     }
     runtimeContext = null;
+    todoSnapshot = undefined;
     currentSessionId = null;
     currentIntercomSessionId = null;
     sessionStartedAt = null;
   });
+  pi.on("session_tree", () => { watchHistory.reset(); });
+  const refreshBranchTodos = (_event: unknown, ctx: ExtensionContext) => {
+    if (getLiveContext(ctx) && hasTodoPackage() && process.env.PI_INTERCOM_TELEMETRY_CONTENT !== "0") shareTodos(replayTodos(ctx.sessionManager.getBranch()));
+  };
+  pi.on("session_compact", refreshBranchTodos);
+  pi.on("session_tree", refreshBranchTodos);
   pi.on("turn_end", () => {
     if (!getLiveContext()) {
       return;
@@ -1811,6 +1842,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   pi.on("tool_execution_end", (event) => {
     if (!getLiveContext()) {
       return;
+    }
+    if (event.toolName === "todo" && !event.isError && hasTodoPackage() && process.env.PI_INTERCOM_TELEMETRY_CONTENT !== "0") {
+      const snapshot = projectTodos(event.result?.details);
+      if (snapshot) shareTodos(snapshot);
     }
     activeTools.delete(event.toolCallId);
     syncPresenceStatus();
@@ -2166,8 +2201,14 @@ Use this to communicate findings, request help, or coordinate work with other se
 Target a session by name, full session ID, or the short id shown in parentheses
 by "list" (a leading prefix of the ID is enough). Prefer the short id when two
 sessions share a name. Re-list before reusing a session ID; skip if it resolves to self.
+Watch is a pull-only current-branch history read, not messaging or subscribing.
+Sharing defaults on within the authenticated scope; history may contain sensitive
+user input/tool output without automatic secret redaction. Targets can disable
+watchEnabled. Query matching is approximate and preview-based, with explicit fallback.
 
 Usage:
+  intercom({ action: "watch", to: "name-or-id" }) → Read recorded current-branch history without waking the target
+  intercom({ action: "watch", to: "name-or-id", query: "topic" }) → Launch one bounded system_one relevance judgment and return only matching events (no query = no model call)
   intercom({ action: "list" })                    → List active sessions
   intercom({ action: "list-cwd" })                → List sessions in the current working directory
   intercom({ action: "list-cwd", cwd: "/path" })  → List sessions in a specific directory
@@ -2183,12 +2224,19 @@ Usage:
       "Use to coordinate with other local pi sessions: list peers, send updates, ask for help, or check intercom connectivity.",
 
     parameters: Type.Object({
-      action: StringEnum(["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', or 'cancel'",
+      action: StringEnum(["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel", "watch"] as const, {
+        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', 'cancel', or 'watch'",
       }),
       to: Type.Optional(Type.String({
         description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the inbound message.",
       })),
+      direction: Type.Optional(StringEnum(["older", "newer"] as const, { description: "Watch traversal; default older. First call returns latest page chronologically." })),
+      cursor: Type.Optional(Type.String({ maxLength: 2048, description: "Opaque olderCursor/newerCursor from a previous watch page." })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, description: "Watch event limit; default 20." })),
+      maxBytes: Type.Optional(Type.Integer({ minimum: 1024, maximum: 32768, description: "Complete watch response UTF-8 budget; default 12288." })),
+      query: Type.Optional(Type.String({ minLength: 1, maxLength: 2000, description: "The System One relevance filter switch. Without query, system_one is never called and the whole window is returned. With query, the watcher launches one batched system_one noul judgment over at most 40 events/32 KiB of previews and returns only events with p>=0.5, each showing its probability; filter.mode='filtered' confirms the launch, filter.launched records it, and filter.mode='fallback' means no model work happened (reason given). This is separate from calling system_one yourself." })),
+      eventId: Type.Optional(Type.String({ maxLength: 512, description: "Read a returned event's full text in bounded chunks; incompatible with cursor, query and direction." })),
+      offset: Type.Optional(Type.Integer({ minimum: 0, description: "UTF-8 byte offset for eventId; use nextOffset." })),
       message: Type.Optional(Type.String({
         description: "Message to send (for 'send', 'ask', or 'reply' action)",
       })),
@@ -2241,6 +2289,34 @@ Usage:
       const { action, to, message, attachments, paths, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus } = params;
 
       switch (action) {
+        case "watch": {
+          let maxBytes = 12 * 1024;
+          try {
+            if (!to?.trim()) throw new Error("watch requires to");
+            const request: WatchRequest = Object.fromEntries(["direction", "cursor", "limit", "maxBytes", "query", "eventId", "offset"].filter(k => params[k as keyof typeof params] !== undefined).map(k => [k, params[k as keyof typeof params]]));
+            validateWatchRequest(request);
+            if (request.maxBytes !== undefined) maxBytes = request.maxBytes;
+            const targetId = await resolveSessionTarget(connectedClient, to);
+            if (!getLiveContext(ctx) || client !== connectedClient) throw new Error("Session replaced");
+            if (!targetId) throw new Error("not_found");
+            if (targetId === connectedClient.sessionId) throw new Error("self_target");
+            const result = await connectedClient.watch(targetId, request.query === undefined ? request : {
+              ...(request.cursor ? { cursor: request.cursor } : {}), direction: request.direction, window: true,
+            }, _signal);
+            _signal?.throwIfAborted();
+            if (!getLiveContext(ctx) || client !== connectedClient) throw new Error("Session replaced");
+            // SAFETY: newer Pi supplies callable tools/executeTool; filterWatch checks both at runtime on older Pi.
+            const details = request.query !== undefined && !("error" in result)
+              ? await filterWatch(result, request, ctx as unknown as WatchToolContext, _signal) : result;
+            _signal?.throwIfAborted();
+            if (!getLiveContext(ctx) || client !== connectedClient) throw new Error("Session replaced");
+            return { content: [{ type: "text", text: formatWatchResult(details, maxBytes) }], details };
+          } catch (error) {
+            _signal?.throwIfAborted();
+            const details = watchError(getErrorMessage(error).slice(0, 256));
+            return { content: [{ type: "text", text: formatWatchResult(details, maxBytes) }], details };
+          }
+        }
         case "list": {
           try {
             const mySessionId = connectedClient.sessionId;
@@ -2385,9 +2461,13 @@ Usage:
                 };
               }
             }
-            const target: DeliveryTarget = cwd
-              ? await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal })
-              : { id: await resolveSessionTarget(connectedClient, to) ?? to, label: to };
+            let target: DeliveryTarget;
+            if (cwd) {
+              target = await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal });
+            } else {
+              if (!to) throw new Error("Missing target");
+              target = { id: await resolveSessionTarget(connectedClient, to) ?? to, label: to };
+            }
             const sendTo = target.id;
             const targetDisplay = target.projectPane ? target.label : to ?? target.label;
             if (sendTo === connectedClient.sessionId) {
@@ -2490,6 +2570,7 @@ Usage:
             if (cwd) {
               target = await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal });
             } else {
+              if (!to) throw new Error("Missing target");
               const resolved = await resolveSessionTarget(connectedClient, to);
               if (!resolved) {
                 return {

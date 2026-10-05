@@ -206,6 +206,7 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
       if (!activeToolNames.includes(tool.name)) activeToolNames.push(tool.name);
     },
     getActiveTools: () => [...activeToolNames],
+    getAllTools: () => tools.map(tool => ({ name: tool.name, sourceInfo: { path: "<test>" } })),
     setActiveTools: (names: string[]) => { activeToolNames = [...names]; },
     registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => unknown }) => {
       commands.set(name, command.handler);
@@ -220,7 +221,7 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
     cwd: repoDir,
     mode: options.mode ?? (options.hasUI ? "tui" : "print"),
     model: { id: "child-model" },
-    sessionManager: { getSessionId: () => typeof options.sessionId === "function" ? options.sessionId() : options.sessionId ?? "session-child-test" },
+    sessionManager: { getSessionId: () => typeof options.sessionId === "function" ? options.sessionId() : options.sessionId ?? "session-child-test", getBranch: () => [] },
     isIdle: options.isIdle ?? (() => true),
     hasUI: options.hasUI ?? false,
     abort: options.abort ?? (() => undefined),
@@ -282,6 +283,77 @@ async function connectRawRegistered(sessionId: string, name: string, sessionOver
   await registered;
   return { socket, writeMessage };
 }
+
+test("watch tool reads an active runtime's raw history without injecting messages or waking it", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: extension } = await import("./index.ts");
+  const target = createExtensionHarness("watched-worker", { sessionId: "watch-target" });
+  const watcher = createExtensionHarness("history-reader", { sessionId: "watch-reader" });
+  const branch = [
+    { type: "message", id: "early", timestamp: "now", message: { role: "user", content: "Earlier request" } },
+    { type: "message", id: "call", timestamp: "now", message: { role: "assistant", content: [{ type: "toolCall", id: "bash-call", name: "bash", arguments: { command: "pwd" } }] } },
+  ];
+  Reflect.set(target.ctx.sessionManager, "getBranch", () => branch);
+  let judgments = 0;
+  Reflect.set(watcher.ctx, "tools", [{ name: "system_one" }]);
+  Reflect.set(watcher.ctx, "executeTool", async (_name: string, args: { questions: Record<string, unknown> }) => {
+    judgments++;
+    return { isError: false, result: { details: { model: "mock-system-one", answers: Object.fromEntries(Object.keys(args.questions).map(id => [id, { type: "noul", noul: id.includes(":call:") ? 1 : 0 }])) } } };
+  });
+  try {
+    extension(target.pi as never); extension(watcher.pi as never);
+    await target.emitLifecycle("session_start"); await watcher.emitLifecycle("session_start");
+    await waitForSessionId(planner, "watch-target"); await waitForSessionId(planner, "watch-reader");
+    await target.emitLifecycle("agent_start");
+    const tool = watcher.tools.find(t => t.name === "intercom")!;
+    const read = (params: Record<string, unknown>) => tool.execute("watch-call", { action: "watch", to: "watched-worker", ...params }, new AbortController().signal, undefined, watcher.ctx);
+    const first = await read({});
+    assert.deepEqual((first.details?.events as Array<{ kind: string }>).map(e => e.kind), ["user", "tool_call"]);
+    assert.equal(judgments, 0);
+    assert.match(first.content[0].text, /Filter: none — no query was sent, so system_one was NOT called/);
+    assert.match(first.content[0].text, /1\. \[user\] /);
+    assert.match((first.details?.target as { status: string }).status, /thinking/);
+    branch.push({ type: "message", id: "result", timestamp: "now", message: { role: "toolResult", content: [{ type: "text", text: "/repo" }] } } as never);
+    const poll = await read({ direction: "newer", cursor: first.details?.newerCursor });
+    assert.deepEqual((poll.details?.events as Array<{ kind: string }>).map(e => e.kind), ["tool_result"]);
+    const filtered = await read({ query: "bash command" });
+    assert.equal(judgments, 1);
+    assert.equal((filtered.details?.filter as { mode: string }).mode, "filtered");
+    assert.deepEqual((filtered.details?.filter as { launched: unknown }).launched, { tool: "system_one", type: "noul", candidates: 3 });
+    assert.deepEqual((filtered.details?.events as Array<{ kind: string }>).map(e => e.kind), ["tool_call"]);
+    assert.match(filtered.content[0].text, /Filter: system_one LAUNCHED — tool=system_one type=noul candidates=3/);
+    assert.match(filtered.content[0].text, /p=1/);
+    Reflect.set(watcher.ctx, "tools", []);
+    const fallback = await read({ query: "bash command" });
+    assert.equal((fallback.details?.filter as { mode: string }).mode, "fallback");
+    assert.equal((fallback.details?.events as unknown[]).length, 3);
+    assert.match(fallback.content[0].text, /Filter: NOT used \(fallback\).*system_one unavailable or not callable/s);
+    await target.emitLifecycle("session_compact");
+    assert.equal((await read({ cursor: first.details?.newerCursor, direction: "newer" })).details?.error, undefined);
+    await target.emitLifecycle("session_tree");
+    assert.equal((await read({ cursor: first.details?.olderCursor })).details?.error, "stale_cursor");
+    assert.equal((await read({ to: "watch-reader" })).details?.error, "self_target");
+    assert.deepEqual(target.sentMessages, []); assert.deepEqual(target.entries, []);
+    const pending = await target.tools.find(t => t.name === "intercom")!.execute("pending", { action: "pending" }, new AbortController().signal, undefined, target.ctx);
+    assert.match(pending.content[0].text, /No unresolved inbound asks/);
+  } finally {
+    await watcher.emitLifecycle("session_shutdown"); await target.emitLifecycle("session_shutdown"); await cleanup();
+  }
+});
+
+test("watchEnabled false is advertised and refuses runtime history reads", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: extension } = await import("./index.ts");
+  const target = createExtensionHarness("private-worker", { sessionId: "private-worker" });
+  try {
+    await withIntercomConfig({ watchEnabled: false }, async () => {
+      extension(target.pi as never); await target.emitLifecycle("session_start");
+      const session = await waitForSessionId(planner, "private-worker");
+      assert.equal(session.watchEnabled, false);
+      assert.equal((await planner.watch(session.id, {}) as { error: string }).error, "disabled");
+    });
+  } finally { await target.emitLifecycle("session_shutdown"); await cleanup(); }
+});
 
 test("opt-in TCP broker requires endpoint state for health and registration", { concurrency: false }, async () => {
   const net = await import("node:net");
@@ -388,11 +460,13 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
         lastActivity: Date.now(),
       },
     }, true);
-    assert.deepEqual(registerMessages, [{
+    assert.equal(registerMessages.length, 1);
+    assert.partialDeepStrictEqual(registerMessages[0], {
       type: "registered",
       sessionId: "authorized-tcp-client",
-      features: ["extension-bus-v1", "exact-send-v1"],
-    }]);
+      features: ["extension-bus-v1", "exact-send-v1", "watch-v1"],
+    });
+    assert.equal(typeof (registerMessages[0] as { endpointEpoch?: unknown }).endpointEpoch, "string");
   } finally {
     if (broker.exitCode === null && broker.signalCode === null) {
       broker.kill("SIGTERM");
@@ -1005,7 +1079,7 @@ test("broker disconnects a connection that exceeds the local rate limit", { conc
 
   try {
     raw.socket.on("error", () => undefined);
-    const closed = once(raw.socket, "close");
+    const closed = new Promise<void>(resolve => raw.socket.once("close", resolve));
     for (let i = 0; i < 300; i += 1) {
       raw.writeMessage(raw.socket, { type: "list", requestId: `flood-${i}` });
     }
@@ -3332,7 +3406,7 @@ test("broker rejects blocking asks to disconnected targets", { concurrency: fals
 });
 
 test("broker never remaps a disconnected mailbox back to the sending session", { concurrency: false }, async () => {
-  const { planner, orchestrator, cleanup } = await setupClients();
+  const { planner, cleanup } = await setupClients();
   const sender = new IntercomClient();
   const replacement = new IntercomClient();
 

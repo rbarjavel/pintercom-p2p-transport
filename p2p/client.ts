@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { WATCH_FEATURE, WATCH_TIMEOUT, validateWatchRequest, validWatchResult, watchError, watchDeadline, jsonBytes, type WatchRequest, type WatchResult, type WatchProvider } from "../watch.ts";
 import { AgentTelemetry, agentServiceTag, endpoint, observerServiceTag, TELEMETRY_PROTOCOL, projectMessage, type Endpoint, type TelemetryEvent } from "./telemetry.ts";
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { createLibp2p, type Libp2p } from "libp2p";
@@ -8,6 +9,7 @@ import { noise } from "@chainsafe/libp2p-noise";
 import { yamux } from "@chainsafe/libp2p-yamux";
 import type { Connection, PeerId, Stream } from "@libp2p/interface";
 import { getIntercomScopeId } from "../config.ts";
+import type { TodoSnapshot } from "./todo.ts";
 import { isMessage, isMessageControl, isMessageReceipt, isSessionInfo } from "../broker/protocol.ts";
 import { EXACT_SEND_FEATURE } from "../types.ts";
 import type {
@@ -91,6 +93,7 @@ export function p2pMdnsAnswers(service: string, peerName: string, addresses: Rea
 }
 
 type PeerEnvelope =
+  | { type: "watch"; scopeId?: string; from: SessionInfo; to: string; targetEpoch?: string; requestId: string; request: WatchRequest }
   | { type: "hello"; scopeId?: string; session: SessionInfo }
   | { type: "message"; scopeId?: string; from: SessionInfo; to: string; message: Message }
   | { type: "presence"; scopeId?: string; from: SessionInfo }
@@ -98,7 +101,7 @@ type PeerEnvelope =
   | { type: "control"; scopeId?: string; from: SessionInfo; control: MessageControl };
 
 type PeerResponse =
-  | { ok: true; session?: SessionInfo; transferId?: string; storedAt?: string }
+  | { ok: true; session?: SessionInfo; transferId?: string; storedAt?: string; watch?: WatchResult; requestId?: string; endpointEpoch?: string }
   | { ok: false; reason: string };
 
 type TransferEnvelope = {
@@ -169,12 +172,46 @@ export class P2PIntercomClient extends EventEmitter {
   private readonly inboundEndpoints = new Map<string, Endpoint>();
   private readonly outboundMessages = new Map<string, Message>();
 
+  private watchProvider?: WatchProvider;
+  private outgoingWatches = new Map<AbortController, string>();
+  private incomingWatches = new Map<AbortController, string>();
+  get endpointEpoch(): string | undefined { return this.registration?.endpointEpoch; }
+  setWatchProvider(provider?: WatchProvider): void {
+    this.watchProvider = provider;
+    for (const c of this.incomingWatches.keys()) c.abort(new Error("replaced"));
+    this.incomingWatches.clear();
+  }
+  async watch(to: string, request: WatchRequest, signal?: AbortSignal): Promise<WatchResult> {
+    validateWatchRequest(request);
+    signal?.throwIfAborted();
+    if (to === this._sessionId) return watchError("self_target");
+    const target = this.resolveTarget(to);
+    if (!target || !this.registration) return watchError("not_found");
+    if (target.session.watchEnabled === undefined) return watchError("unsupported");
+    if (!target.session.watchEnabled) return watchError("disabled");
+    if (this.outgoingWatches.size >= 8) return watchError("busy");
+    const controller = new AbortController();
+    this.outgoingWatches.set(controller, target.session.id);
+    const requestId = randomUUID();
+    try {
+      const envelope: PeerEnvelope = { type: "watch", scopeId: this.scopeId, from: this.registration, to: target.session.id, targetEpoch: target.session.endpointEpoch, requestId, request };
+      if (jsonBytes(this.sign(envelope)) > 8192) return watchError("invalid_request");
+      const response = await this.request(target.peerId, envelope, signal ? AbortSignal.any([signal, controller.signal]) : controller.signal);
+      signal?.throwIfAborted();
+      if (!response.ok) return watchError(response.reason);
+      const live = this.peers.get(target.session.id);
+      if (response.requestId !== requestId || response.endpointEpoch !== target.session.endpointEpoch || !live || live.session.endpointEpoch !== target.session.endpointEpoch || !live.peerId.equals(target.peerId) || !validWatchResult(response.watch, request)) return watchError("stale_target");
+      if (!("error" in response.watch) && (response.watch.target.id !== target.session.id || response.watch.target.endpointEpoch !== target.session.endpointEpoch)) return watchError("stale_target");
+      return response.watch;
+    } finally { this.outgoingWatches.delete(controller); }
+  }
+
   get sessionId(): string | null {
     return this._sessionId;
   }
 
   supportsFeature(feature: string): boolean {
-    return feature === EXACT_SEND_FEATURE;
+    return feature === EXACT_SEND_FEATURE || feature === WATCH_FEATURE;
   }
 
   isConnected(): boolean {
@@ -211,7 +248,7 @@ export class P2PIntercomClient extends EventEmitter {
     });
     this.node = node;
     if (telemetryEnabled) this.telemetry = new AgentTelemetry(node, this.registration);
-    await node.handle(PROTOCOL, (stream, connection) => this.handleStream(stream, connection));
+    await node.handle(PROTOCOL, (stream, connection) => this.handleStream(stream, connection), { maxInboundStreams: 64, maxOutboundStreams: 64 });
     if (this.telemetry) await node.handle(TELEMETRY_PROTOCOL, (stream, connection) => this.telemetry?.acceptObserver(stream, connection.remotePeer), { maxInboundStreams: 64, maxOutboundStreams: 64 });
     await node.handle(TRANSFER_PROTOCOL, (stream, connection) => this.handleTransferStream(stream, connection), {
       maxInboundStreams: 2,
@@ -254,6 +291,9 @@ export class P2PIntercomClient extends EventEmitter {
   async disconnect(): Promise<void> {
     const node = this.node;
     if (!node) return;
+    this.setWatchProvider(undefined);
+    for (const c of this.outgoingWatches.keys()) c.abort(new Error("disconnected"));
+    this.outgoingWatches.clear();
     this.telemetry?.stop();
     this.telemetry = null;
     this.telemetryContent = false;
@@ -421,6 +461,8 @@ export class P2PIntercomClient extends EventEmitter {
     }
   }
 
+  updateTodos(snapshot: TodoSnapshot): void { if (this.telemetryContent) this.telemetry?.updateTodos(snapshot); }
+
   updateExtensionCapabilities(_extensions: SessionRegistration["extensions"]): void {}
 
   sendExtensionMessage(_message: Extract<ClientMessage, { type: "extension_publish" | "extension_state_commit" }>): void {
@@ -488,11 +530,14 @@ export class P2PIntercomClient extends EventEmitter {
     return wire.payload as Record<string, unknown>;
   }
 
-  private async request(peerId: PeerId, envelope: PeerEnvelope): Promise<PeerResponse> {
+  private async request(peerId: PeerId, envelope: PeerEnvelope, signal?: AbortSignal): Promise<PeerResponse> {
     const node = this.node;
     if (!node) throw new Error("Not connected");
-    const timeoutMs = getP2PRequestTimeoutMs();
+    const timeoutMs = envelope.type === "watch" ? WATCH_TIMEOUT : getP2PRequestTimeoutMs();
     const controller = new AbortController();
+    const abort = () => { controller.abort(signal?.reason); stream?.abort(toError(signal?.reason ?? new Error("cancelled"))); };
+    signal?.throwIfAborted();
+    signal?.addEventListener("abort", abort, { once: true });
     let stream: Stream | undefined;
     const timer = setTimeout(() => {
       const error = new Error(`P2P ${envelope.type} request timed out after ${timeoutMs}ms`);
@@ -502,7 +547,9 @@ export class P2PIntercomClient extends EventEmitter {
     try {
       stream = await node.dialProtocol(peerId, PROTOCOL, { signal: controller.signal });
       await writeJson(stream, this.sign(envelope));
-      const response = this.verify(await readJson(stream));
+      const wire = await readJson(stream);
+      if (envelope.type === "watch" && jsonBytes(wire) > 96 * 1024) throw new Error("Oversized watch response");
+      const response = this.verify(wire);
       if (!response || typeof response !== "object" || typeof (response as { ok?: unknown }).ok !== "boolean") {
         throw new Error("Invalid p2p response");
       }
@@ -512,13 +559,20 @@ export class P2PIntercomClient extends EventEmitter {
       throw error;
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
     }
   }
 
   private async handleStream(stream: Stream, connection: Connection): Promise<void> {
+    const controller = new AbortController();
+    const close = () => controller.abort(new Error("disconnected"));
+    stream.addEventListener("close", close);
     try {
-      const value = this.verify(await readJson(stream));
-      const response = this.handleEnvelope(value, connection.remotePeer);
+      const wire = await readJson(stream);
+      const value = this.verify(wire);
+      if (value.type === "watch" && jsonBytes(wire) > 8192) throw new Error("Oversized watch request");
+      const response = await this.handleEnvelope(value, connection.remotePeer, controller.signal);
+      controller.signal.throwIfAborted();
       await writeJson(stream, this.sign(response));
     } catch (error) {
       try {
@@ -526,7 +580,7 @@ export class P2PIntercomClient extends EventEmitter {
       } catch {
         stream.abort(toError(error));
       }
-    }
+    } finally { stream.removeEventListener("close", close); }
   }
 
   private async handleTransferStream(stream: Stream, connection: Connection): Promise<void> {
@@ -583,10 +637,32 @@ export class P2PIntercomClient extends EventEmitter {
     }
   }
 
-  private handleEnvelope(value: unknown, peerId: PeerId): PeerResponse {
+  private async handleEnvelope(value: unknown, peerId: PeerId, signal?: AbortSignal): Promise<PeerResponse> {
     if (!value || typeof value !== "object") return { ok: false, reason: "Invalid p2p message" };
     const envelope = value as Record<string, unknown>;
     if ((envelope.scopeId ?? undefined) !== this.scopeId) return { ok: false, reason: "Intercom scope mismatch" };
+
+    if (envelope.type === "watch") {
+      const sessionId = this.sessionByPeer.get(peerId.toString());
+      const known = sessionId ? this.peers.get(sessionId) : undefined;
+      const registration = this.registration;
+      if (!registration || !known || !known.peerId.equals(peerId) || !isSessionInfo(envelope.from) || envelope.from.id !== known.session.id || envelope.from.endpointEpoch !== known.session.endpointEpoch || envelope.to !== registration.id || envelope.targetEpoch !== registration.endpointEpoch || typeof envelope.requestId !== "string" || envelope.requestId.length > 128 || jsonBytes(value) > 8192) return { ok: false, reason: "unauthorized" };
+      try { validateWatchRequest(envelope.request); } catch { return { ok: false, reason: "invalid_request" }; }
+      const provider = this.watchProvider;
+      const respond = (watch: WatchResult): PeerResponse => ({ ok: true, watch, requestId: envelope.requestId as string, endpointEpoch: registration.endpointEpoch });
+      if (registration.watchEnabled === undefined) return respond(watchError("unsupported"));
+      if (!registration.watchEnabled || !provider) return respond(watchError("disabled"));
+      if (this.incomingWatches.size >= 32 || [...this.incomingWatches.values()].filter(id => id === sessionId).length >= 8) return respond(watchError("busy"));
+      const controller = new AbortController();
+      this.incomingWatches.set(controller, sessionId!);
+      try {
+        const result = await watchDeadline(s => provider(envelope.request as WatchRequest, s), WATCH_TIMEOUT, signal ? AbortSignal.any([signal, controller.signal]) : controller.signal);
+        const live = this.peers.get(sessionId!);
+        if (this.registration !== registration || this.watchProvider !== provider || !live || live.session.endpointEpoch !== known.session.endpointEpoch || !live.peerId.equals(peerId)) return { ok: false, reason: "stale_target" };
+        return respond(validWatchResult(result, envelope.request as WatchRequest) ? result : watchError("invalid_response"));
+      } catch (error) { return respond(watchError(error instanceof Error ? error.message : "failed")); }
+      finally { this.incomingWatches.delete(controller); }
+    }
 
     if (envelope.type === "hello" && isSessionInfo(envelope.session)) {
       this.upsertPeer(peerId, envelope.session);
@@ -630,7 +706,10 @@ export class P2PIntercomClient extends EventEmitter {
     if (session.id === this._sessionId) return;
     const peerKey = peerId.toString();
     const existing = this.peers.get(session.id);
-    if (existing && !existing.peerId.equals(peerId)) this.sessionByPeer.delete(existing.peerId.toString());
+    if (existing && (!existing.peerId.equals(peerId) || existing.session.endpointEpoch !== session.endpointEpoch)) {
+      for (const [c, id] of [...this.incomingWatches, ...this.outgoingWatches]) if (id === session.id) c.abort(new Error("replaced"));
+      if (!existing.peerId.equals(peerId)) this.sessionByPeer.delete(existing.peerId.toString());
+    }
     const previousSessionId = this.sessionByPeer.get(peerKey);
     if (previousSessionId && previousSessionId !== session.id) this.peers.delete(previousSessionId);
     this.peers.set(session.id, { peerId, session: { ...session, trustedLocal: false } });
@@ -652,6 +731,7 @@ export class P2PIntercomClient extends EventEmitter {
       if (route.equals(peerId)) this.outboundRoutes.delete(messageId);
     }
     if (!sessionId) return;
+    for (const [c, id] of [...this.incomingWatches, ...this.outgoingWatches]) if (id === sessionId) c.abort(new Error("disconnected"));
     this.sessionByPeer.delete(peerKey);
     this.peers.delete(sessionId);
     const left: BrokerMessage = { type: "session_left", sessionId };

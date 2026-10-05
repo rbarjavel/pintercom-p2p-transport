@@ -119,24 +119,50 @@ Press **Alt+I** or **Cmd+I** (macOS terminals that forward Command via the Kitty
 
 History uses existing session records (including other branches, inherited fork history, and pre-compaction entries), in local recording order. It refreshes every 250 ms while open and works offline with saved history. LIVE means following recorded messages, not proof of delivery or processing. Incoming messages appear once recorded by Pi; timestamps come from the original message/record and may reflect different clocks. Replies are identified by reply metadata or saved ask-waiter records, never inferred from wording. Attachments show names only; exchanges solely between other sessions are not included.
 
-## P2P Live Viewer
+## P2P Telemetry and Live Viewer
 
-Set `PI_INTERCOM_P2P_KEY` (at least 16 characters) and optional `PI_INTERCOM_SCOPE_ID` on all participants. P2P agents report telemetry **including message text by default**. Set `PI_INTERCOM_TELEMETRY=0` before starting Pi to disable reporting entirely, or `PI_INTERCOM_TELEMETRY_CONTENT=0` to report metadata without message text. Then run `npm run web` and open `http://<server-LAN-IP>:8787/` (or `http://127.0.0.1:8787/` locally). Override with `npm run web -- --port 9000`; from a project with the package installed, run `./node_modules/.bin/tsx ./node_modules/pi-intercom/p2p/viewer-web.ts --port 9000`. The viewer listens on **0.0.0.0** and has **no HTTP authentication**: anyone who can reach its port can read message text, IDs, and metadata. Use only on a trusted LAN; restrict the port with a firewall and never expose it to the internet. Requests must use the interface's IP address (or `localhost` on loopback), with matching Host and Origin headers to prevent DNS rebinding. It never appears as an agent or message target. The collector discovers agents on the LAN and initiates encrypted, authenticated P2P telemetry streams to them, so the collector's own inbound P2P TCP port need not be reachable from other machines. Agents can also connect to the collector when that port is reachable. Both ends need the same P2P key/scope and running Pi agents need the updated package loaded at startup.
+P2P agents report telemetry **including message text and todo snapshots by default**.
+Set `PI_INTERCOM_TELEMETRY=0` before starting Pi to disable reporting entirely,
+or `PI_INTERCOM_TELEMETRY_CONTENT=0` to report metadata without message text or todos.
+Attachment/file contents are never reported. Set the same `PI_INTERCOM_P2P_KEY`
+(at least 16 characters) and optional `PI_INTERCOM_SCOPE_ID` on agents and collector.
 
-`createViewerServer(observer)` in `p2p/viewer-server.ts` returns an HTTP server. The caller starts/stops `TelemetryObserver` separately and listens on **0.0.0.0**:
+As of **0.13.0**, the collector, HTTP server and browser board live in the separate
+[`pi-intercom-web` package](https://www.npmjs.com/package/pi-intercom-web), not this Pi extension:
 
-```ts
-import { TelemetryObserver } from "./p2p/telemetry.ts";
-import { createViewerServer } from "./p2p/viewer-server.ts";
-
-const observer = new TelemetryObserver();
-const server = createViewerServer(observer);
-await observer.start();
-server.listen(8787, "0.0.0.0"); // open http://<server-LAN-IP>:8787/
-// On shutdown: server.close(); await observer.stop();
+```bash
+mkdir intercom-viewer && cd intercom-viewer
+npm init -y
+npm install pi-intercom-web
+export PI_INTERCOM_P2P_KEY="replace-with-a-long-random-shared-secret"
+npx tsx node_modules/pi-intercom-web/viewer-web.ts
+# Optional: append --port 9000 (default: 8787)
 ```
 
-`GET /events` streams an initial snapshot and subsequent interaction and layout updates via SSE; `POST /layout`, `POST /layout/group`, and `POST /layout/reset` update the shared board. Agents are framed by hostname; those without a known hostname are hidden from the board but remain in message history. Dragging a frame's title moves its agents together, while individual agents remain movable. The server keeps the latest 1,000 interactions, including separate linked cancellation rows, with up to 16 status updates each; reconnecting receives a fresh snapshot. The UI marks truncated history and dropped sender telemetry. With content reporting enabled (the default), it transmits up to 16 KiB of each message's text over the authenticated telemetry stream and renders a safe Markdown subset in floating conversation windows. Drag agent cards to arrange them, drag empty space to pan, scroll to pan, and Ctrl/⌘+scroll or use toolbar buttons to zoom (25–200%) and fit the graph. Click an agent for all its retained interactions or a connection for both directions of that pair; move and resize multiple conversation windows independently. Keyboard arrows move a focused agent or window title, and resize a focused ↘ control; Escape closes a focused window. Agent positions are shared live across all viewers of this server (last update wins) and reset when the server restarts; Reset layout restores the shared grid for everyone. Camera/zoom stay in each browser's localStorage, while conversation windows remain local and message bodies are not stored there. The graph shows connected reporting agents and agents in collected interactions. A green pulsing border means the agent reports thinking or tool use; idle/unknown agents remain still, and new messages briefly animate their connection. Motion is disabled when the browser requests reduced motion. With `PI_INTERCOM_TELEMETRY_CONTENT=0`, it displays only endpoint metadata, action, status, IDs and attachment names/relative paths/counts. Attachment/file contents are never sent; message text itself may contain sensitive paths or secrets, so keep your key private. Live collection begins when a reporting agent connects; there is no backfill or persistence. Coverage is incomplete when neither endpoint reports (older/opted-out peers), and discovery reaches only peers on the existing LAN-local mDNS network. Do not port-forward this unauthenticated viewer to an untrusted network.
+In a checkout of `pi-intercom-web`, use `npm install && npm run web`.
+Open `http://<server-LAN-IP>:8787/` (or `http://127.0.0.1:8787/` locally).
+The viewer listens on **0.0.0.0** with **no HTTP authentication**: anyone who can
+reach its port can read message text, todo subjects, IDs and metadata. Use only
+on a trusted LAN; firewall the port and never expose or port-forward it to the
+internet. Host/Origin checks require the interface IP address (or localhost on
+loopback), preventing DNS rebinding but not providing authentication.
+
+The collector discovers agents on LAN-local mDNS and initiates encrypted,
+authenticated streams; agents can also connect to it. It never appears as an
+agent or message target. Collection is live, best-effort and in-memory, with no
+backfill or persistence; older/opted-out peers may leave gaps. Restart agents
+after changing configuration.
+
+### Shared telemetry contract
+
+Import `pi-intercom/p2p/telemetry-contract.ts` using a TypeScript runner such as
+`tsx`. This packaged subpath provides telemetry types (including todos),
+`TELEMETRY_PROTOCOL`, service-tag derivation, key validation, bounded
+length-prefixed JSON framing, HMAC signing/verification, and event/todo
+validation. The wire protocol remains `/pi-intercom/telemetry/1.0.0`, with
+64 KiB frames and up to 16 KiB message text. `AgentTelemetry` and Pi-specific
+message/todo projection remain in this package; `TelemetryObserver` is now in
+`pi-intercom-web/telemetry.ts`. Existing other package subpaths remain accessible.
 
 ## How the P2P Layer Works
 
@@ -209,6 +235,83 @@ intercom({
 Relative paths resolve from the sending session's working directory. The receiver validates paths, rejects symlinks and non-regular files, streams data into a temporary directory, verifies SHA-256 hashes, and only then delivers the message. Completed transfers are stored under `~/.pi/agent/intercom/inbox/<session-id>/<message-id>/`; the receiving agent gets that absolute path in a generated context attachment.
 
 Transfers default to a 512 MiB total limit and 10,000 entries. They do not overwrite an existing transfer. The broker transport continues to support inline `attachments`, but not `paths`.
+
+## Read an Agent's Recorded History
+
+`watch` is a pull-only read over either transport. It does not send a message,
+create a session, wake the target's model, subscribe, or publish telemetry.
+Address a connected peer by name, full ID, or an unambiguous ID prefix:
+
+```typescript
+intercom({ action: "watch", to: "worker" })
+intercom({ action: "watch", to: "worker", cursor: "<olderCursor>" })
+intercom({ action: "watch", to: "worker", direction: "newer", cursor: "<newerCursor>" })
+intercom({ action: "watch", to: "worker", query: "authentication failure" })  // launches system_one relevance filtering
+intercom({ action: "watch", to: "worker", eventId: "<returned event ID>", offset: 0 })
+```
+
+The first page is the latest bounded window, presented chronologically (also
+when `direction: "newer"` is used without a cursor). Defaults are 20 events and
+12 KiB; `limit` accepts 1–50 and `maxBytes` accepts 1–32 KiB. The model-facing
+text is a human-readable rendering (target, page/filter summary, full cursors,
+then one numbered block per event); it falls back to the equivalent bounded JSON
+if it would exceed the byte budget. Structured `details` always carries the same
+bounded data. An exceptionally small budget relative to metadata returns
+`budget_too_small`: increase `maxBytes`.
+
+Pages include target identity/status, history generation, `olderCursor`,
+`newerCursor`, `hasOlder`, `hasNewer`, events and truncation flags. Older cursors
+retain their original snapshot across appends; newer cursors support explicit
+polling, including at an empty live tail. There is no background polling loop.
+Tree navigation, session/endpoint replacement, tampering and missing anchors
+return `stale_cursor`; normal appends and compaction do not invalidate cursors.
+
+History comes from the current raw branch, including activity before the first
+read and pre-compaction entries. It includes recorded user/assistant text, tool
+calls/arguments/results/errors, direct bash, custom conversational messages and
+summary markers. Nested tool metadata is included only when Pi recorded it;
+Pi does **not** record nested results. System prompts, thinking/signatures,
+opaque details, extension state, binary content and replay metadata are excluded.
+Images are placeholders, terminal controls are stripped, and individual previews
+are at most 2 KiB. Partial token streams/tool output and abandoned branches are
+not exposed. The implementation scans the raw branch linearly per read; no index,
+embeddings, database or extra persistence is added.
+
+To inspect shortened text, use `eventId` and then the returned `nextOffset`
+until it is absent. Offsets are UTF-8 bytes and must be character boundaries.
+`eventId` cannot be combined with `cursor`, `query` or `direction`. Only events
+on the current authorized branch/generation are retrievable, never file paths.
+
+`query` (nonblank, at most 2,000 characters) **is** the System One relevance
+filter switch. Without it, no model work happens at all and the whole window is
+returned. With it, the watcher launches **one** batched `system_one` `noul`
+judgment — through Pi's normal permission hooks, never the target's model — over
+one candidate window of at most 40 events/32 KiB of preview text, and returns
+only original events with probability at least 0.5, in conversation order, each
+carrying its `score`. Matching is approximate and preview-based, not exhaustive
+search. Empty matches still advance the scan boundary.
+
+Read the result instead of assuming: `filter.mode: "filtered"` means the call was
+launched, and `filter.launched` records it (`tool`, `type`, `candidates`) beside
+`query`, `model` when reported, `examined`/`returned` and `windowExhausted`.
+`filter.mode: "fallback"` means no model work happened, with `filter.reason`
+saying why (tool absent/denied, invalid answers, provider failure, or the
+15-second model timeout) and the unfiltered window returned in its place. No
+`filter` block means no `query` was sent. Note this is distinct from calling
+`system_one` yourself on a transcript you read: that yields judgments, not a
+relevance selection. No automatic activation, credentials, alternative model or
+lexical fallback is used. Cancellation stops the operation.
+
+**Privacy:** sharing is enabled by default (`"watchEnabled": true` in the same
+intercom `config.json`). Set `"watchEnabled": false` on a target and restart it
+to refuse history reads. History may contain sensitive user input and tool output;
+there is **no automatic secret redaction**. Existing authenticated intercom
+scopes are the access boundary. Session registration/listing advertises
+`watchEnabled`; older peers/brokers return `unsupported`, disabled targets return
+`disabled`, and disconnected targets are not browsable. Watch never opens panes.
+Requests are capped at 8 KiB, wire replies at 96 KiB, with eight in-flight reads
+per requester and 32 per target (`busy` beyond that), a 10-second transport
+request timeout, cancellation and disconnect/replacement cleanup.
 
 ## Network Requirements
 

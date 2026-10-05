@@ -163,6 +163,25 @@ test("pending asks can be explicitly dismissed without removing retryable failur
   assert.deepEqual(tracker.listPending(1002).map((context) => context.message.id), ["ask-2"]);
 });
 
+test("cancelled asks report a stale reply hint clearly", () => {
+  const tracker = new ReplyTracker();
+  tracker.recordIncomingMessage(createSession("planner-id", "planner"), createMessage("ask-1", "Need a decision"), 1000);
+
+  tracker.cancelPendingAsk("ask-1");
+
+  assert.throws(() => tracker.resolveReplyTarget({ replyTo: "ask-1" }, 1001), /was cancelled by planner; do not retry it with send/);
+});
+
+test("a cancelled ask prevents send inference from answering another ask by the same sender", () => {
+  const tracker = new ReplyTracker();
+  tracker.recordIncomingMessage(createSession("planner-id", "planner"), createMessage("ask-1", "Old question"), 1000);
+  tracker.cancelPendingAsk("ask-1");
+  tracker.recordIncomingMessage(createSession("planner-id", "planner"), createMessage("ask-2", "New question"), 1001);
+
+  assert.equal(tracker.findUniquePendingAskFrom("planner-id", 1002), null);
+  assert.deepEqual(tracker.listPending(1002).map((context) => context.message.id), ["ask-2"]);
+});
+
 test("dismissing a pending ask removes queued turn context", () => {
   const tracker = new ReplyTracker();
   const context = tracker.recordIncomingMessage(createSession("planner-id", "planner"), createMessage("ask-1", "Need a decision"), 1000);

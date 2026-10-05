@@ -1,4 +1,6 @@
 export const EXTENSION_BUS_FEATURE = "extension-bus-v1";
+import type { WatchRequest, WatchResult } from "./watch.ts";
+
 export const EXACT_SEND_FEATURE = "exact-send-v1";
 
 export type DeliveryState = "socket_delivered" | "queued" | "failed" | "unknown";
@@ -14,6 +16,8 @@ export interface SessionInfo {
   id: string;
   /** Broker-owned lifetime of this live endpoint. */
   endpointEpoch?: string;
+  /** Recorded current-branch history sharing; absent on older peers. */
+  watchEnabled?: boolean;
   name?: string;
   /** True only when the extension synthesized name for an unnamed runtime. */
   runtimeFallbackAlias?: boolean;
@@ -110,6 +114,9 @@ export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "pe
 
 export type ClientMessage =
   | { type: "register"; session: SessionRegistration; sessionId?: string; stateId?: string; scopeId?: string }
+  | { type: "watch_request"; requestId: string; to: string; targetEpoch: string; request: WatchRequest }
+  | { type: "watch_response"; requestId: string; result: WatchResult }
+  | { type: "watch_cancel"; requestId: string }
   | { type: "unregister" }
   | { type: "extension_capabilities_update"; extensions: ExtensionCapability[] }
   | { type: "list"; requestId: string }
@@ -135,7 +142,10 @@ export type ClientMessage =
     };
 
 export type BrokerMessage =
-  | { type: "registered"; sessionId: string; features?: string[] }
+  | { type: "watch_request"; requestId: string; request: WatchRequest }
+  | { type: "watch_response"; requestId: string; result: WatchResult }
+  | { type: "watch_cancel"; requestId: string }
+  | { type: "registered"; sessionId: string; endpointEpoch?: string; features?: string[] }
   | { type: "sessions"; requestId: string; sessions: SessionInfo[] }
   | { type: "message"; from: SessionInfo; message: Message }
   | { type: "presence_update"; session: SessionInfo }

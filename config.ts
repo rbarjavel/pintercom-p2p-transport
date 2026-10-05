@@ -54,6 +54,9 @@ export interface IntercomConfig {
   
   /** Enable/disable intercom (default: true) */
   enabled: boolean;
+
+  /** Share recorded history with authenticated peers in this intercom scope. */
+  watchEnabled: boolean;
   
   /** Show reply hint in incoming messages (default: true) */
   replyHint: boolean;
@@ -71,6 +74,7 @@ const defaults: IntercomConfig = {
   inboundTrigger: "always",
   toolVisibility: "always",
   enabled: true,
+  watchEnabled: true,
   replyHint: true,
 };
 
@@ -127,6 +131,11 @@ export function loadConfig(): IntercomConfig {
         throw new Error(`"confirmSend" must be a boolean`);
       }
       config.confirmSend = parsedConfig.confirmSend;
+    }
+
+    if (Object.hasOwn(parsedConfig, "watchEnabled")) {
+      if (typeof parsedConfig.watchEnabled !== "boolean") throw new Error('"watchEnabled" must be a boolean');
+      config.watchEnabled = parsedConfig.watchEnabled;
     }
 
     if (Object.hasOwn(parsedConfig, "enabled")) {

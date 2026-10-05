@@ -124,6 +124,7 @@ export function isMessage(value: unknown): value is Message {
 }
 
 export function isSessionInfo(value: unknown): value is SessionInfo {
+  if (isRecord(value) && value.watchEnabled !== undefined && typeof value.watchEnabled !== "boolean") return false;
   if (!isRecord(value)) {
     return false;
   }
@@ -189,6 +190,7 @@ export function isSessionId(value: unknown): value is string {
 }
 
 export function isSessionRegistration(value: unknown): value is SessionRegistration {
+  if (isRecord(value) && value.watchEnabled !== undefined && typeof value.watchEnabled !== "boolean") return false;
   if (!isRecord(value)) {
     return false;
   }

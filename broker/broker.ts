@@ -1,4 +1,5 @@
 import net from "net";
+import { WATCH_FEATURE, WATCH_TIMEOUT, validateWatchRequest, validWatchResult, watchError, jsonBytes } from "../watch.ts";
 import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { createHash, randomUUID } from "crypto";
@@ -183,8 +184,8 @@ function isPendingAskRecord(value: unknown): value is PendingAskRecord {
     && typeof value.target.sessionId === "string"
     && (typeof value.target.name === "string" || value.target.name === null)
     && typeof value.question === "string"
-    && Number.isSafeInteger(value.createdAt)
-    && Number.isSafeInteger(value.expiresAt)
+    && typeof value.createdAt === "number" && Number.isSafeInteger(value.createdAt)
+    && typeof value.expiresAt === "number" && Number.isSafeInteger(value.expiresAt)
     && value.expiresAt >= value.createdAt;
 }
 
@@ -200,7 +201,18 @@ function ensurePendingAskRecordDir(): void {
 }
 
 class IntercomBroker {
+  private watches = new Map<string, { requester: ConnectedSession; target: ConnectedSession; requestId: string; timer: ReturnType<typeof setTimeout> }>();
   private sessions = new Map<string, ConnectedSession>();
+
+  private clearWatches(socket: net.Socket): void {
+    for (const [id, route] of this.watches) {
+      if (route.requester.socket !== socket && route.target.socket !== socket) continue;
+      clearTimeout(route.timer);
+      this.watches.delete(id);
+      if (route.target.socket !== socket && !route.target.socket.destroyed) writeMessage(route.target.socket, { type: "watch_cancel", requestId: id });
+      if (route.requester.socket !== socket && !route.requester.socket.destroyed) writeMessage(route.requester.socket, { type: "watch_response", requestId: route.requestId, result: watchError("disconnected") });
+    }
+  }
   private askEdges = new Map<string, AskEdge>();
   private messageReceiptRoutes = new Map<string, MessageReceiptRoute>();
   private disconnectedSessions = new Map<string, DisconnectedSession>();
@@ -317,6 +329,7 @@ class IntercomBroker {
 
     socket.on("close", () => {
       clearRegistrationTimeout();
+      this.clearWatches(socket);
       this.connections.delete(socket);
       if (sessionKey) {
         const existing = this.sessions.get(sessionKey);
@@ -457,6 +470,7 @@ class IntercomBroker {
           break;
         }
         if (previous) {
+          this.clearWatches(previous.socket);
           this.clearMessageReceiptRoutesForSession(key);
           previous.socket.end();
         }
@@ -464,6 +478,7 @@ class IntercomBroker {
         const info: SessionInfo = {
           id,
           endpointEpoch: randomUUID(),
+          ...(session.watchEnabled !== undefined ? { watchEnabled: session.watchEnabled } : {}),
           ...(session.name !== undefined ? { name: session.name } : {}),
           ...(session.runtimeFallbackAlias !== undefined ? { runtimeFallbackAlias: session.runtimeFallbackAlias } : {}),
           cwd: session.cwd,
@@ -502,7 +517,8 @@ class IntercomBroker {
         writeMessage(socket, {
           type: "registered",
           sessionId: id,
-          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE],
+          endpointEpoch: info.endpointEpoch,
+          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE, WATCH_FEATURE],
         });
         this.broadcast({ type: "session_joined", session: info }, key, scopeId);
 
@@ -532,6 +548,7 @@ class IntercomBroker {
       }
 
       case "unregister": {
+        this.clearWatches(socket);
         if (!currentKey) {
           throw new Error("Received unregister before register");
         }
@@ -587,6 +604,52 @@ class IntercomBroker {
         break;
       }
 
+      case "watch_request": {
+        const requester = currentKey ? this.sessions.get(currentKey) : undefined;
+        if (!requester || requester.socket !== socket) throw new Error("Invalid watch requester");
+        const requestId = clientMessage.requestId;
+        if (typeof requestId !== "string" || !requestId || requestId.length > 128 || jsonBytes(clientMessage) > 8192) throw new Error("Invalid watch request");
+        const fail = (code: string) => writeMessage(socket, { type: "watch_response", requestId, result: watchError(code) });
+        try { validateWatchRequest(clientMessage.request); } catch { fail("invalid_request"); break; }
+        const target = [...this.sessions.values()].find(s => s.info.id === clientMessage.to && sameScope(s.scopeId, requester.scopeId));
+        if (!target) { fail("not_found"); break; }
+        if (target === requester) { fail("self_target"); break; }
+        if (target.info.endpointEpoch !== clientMessage.targetEpoch) { fail("stale_target"); break; }
+        if (target.info.watchEnabled === undefined) { fail("unsupported"); break; }
+        if (!target.info.watchEnabled) { fail("disabled"); break; }
+        const routes = [...this.watches.values()];
+        if (routes.some(r => r.requester === requester && r.requestId === requestId)) { fail("invalid_request"); break; }
+        if (routes.filter(r => r.requester === requester).length >= 8 || routes.filter(r => r.target === target).length >= 32) { fail("busy"); break; }
+        const id = randomUUID();
+        const timer = setTimeout(() => {
+          this.watches.delete(id);
+          if (!socket.destroyed) fail("timeout");
+          if (!target.socket.destroyed) writeMessage(target.socket, { type: "watch_cancel", requestId: id });
+        }, WATCH_TIMEOUT);
+        this.watches.set(id, { requester, target, requestId, timer });
+        writeMessage(target.socket, { type: "watch_request", requestId: id, request: clientMessage.request });
+        break;
+      }
+      case "watch_response": {
+        if (typeof clientMessage.requestId !== "string") throw new Error("Invalid watch response");
+        const route = this.watches.get(clientMessage.requestId);
+        if (!route) break; // Late replies are never exposed.
+        if (route.target.socket !== socket || this.sessions.get(route.target.key) !== route.target || this.sessions.get(route.requester.key) !== route.requester) throw new Error("Spoofed or stale watch response");
+        if (jsonBytes(clientMessage) > 96 * 1024 || !validWatchResult(clientMessage.result)) throw new Error("Invalid watch response");
+        clearTimeout(route.timer);
+        this.watches.delete(clientMessage.requestId);
+        writeMessage(route.requester.socket, { type: "watch_response", requestId: route.requestId, result: clientMessage.result });
+        break;
+      }
+      case "watch_cancel": {
+        for (const [id, route] of this.watches) {
+          if (route.requester.socket !== socket || route.requestId !== clientMessage.requestId) continue;
+          clearTimeout(route.timer); this.watches.delete(id);
+          writeMessage(route.target.socket, { type: "watch_cancel", requestId: id });
+        }
+        break;
+      }
+
       case "list": {
         if (typeof clientMessage.requestId !== "string") {
           throw new Error("Invalid list message");
@@ -614,6 +677,7 @@ class IntercomBroker {
           this.writeDeliveryFailure(socket, messageId, "Invalid message format", "E_INVALID_MESSAGE");
           break;
         }
+        let destination = clientMessage.to;
         const fromSession = this.sessions.get(currentKey);
         if (!fromSession || fromSession.socket !== socket) {
           this.writeDeliveryFailure(socket, message.id, "Sender session not found", "E_SENDER_NOT_FOUND");
@@ -654,10 +718,10 @@ class IntercomBroker {
             this.writeDeliveryFailure(socket, message.id, "Target endpoint changed before delivery", "E_TARGET_REBOUND", true);
             break;
           }
-          clientMessage.to = targetId;
+          destination = targetId;
         }
 
-        const targets = this.findSessions(clientMessage.to, fromSession.scopeId);
+        const targets = this.findSessions(destination, fromSession.scopeId);
         if (targets.length === 1) {
           const target = targets[0];
           if (message.replyTo && !replyEdge && (replyRoute?.to !== currentKey || replyRoute.from !== target.key)) {
@@ -728,11 +792,11 @@ class IntercomBroker {
         }
 
         if (targets.length > 1) {
-          this.writeDeliveryFailure(socket, message.id, `Multiple sessions named \"${clientMessage.to}\" are connected. Use the session ID instead.`, "E_AMBIGUOUS_TARGET");
+          this.writeDeliveryFailure(socket, message.id, `Multiple sessions named \"${destination}\" are connected. Use the session ID instead.`, "E_AMBIGUOUS_TARGET");
           break;
         }
 
-        const disconnectedTargets = this.findDisconnectedSessions(clientMessage.to, fromSession.scopeId);
+        const disconnectedTargets = this.findDisconnectedSessions(destination, fromSession.scopeId);
         if (disconnectedTargets.length === 1) {
           if (message.replyTo && !replyEdge) {
             this.writeDeliveryFailure(socket, message.id, "Reply target does not match a received message", "E_REPLY_TARGET");
@@ -782,7 +846,7 @@ class IntercomBroker {
         }
 
         if (disconnectedTargets.length > 1) {
-          this.writeDeliveryFailure(socket, message.id, `Multiple disconnected sessions named \"${clientMessage.to}\" can receive queued mail. Use the session ID instead.`, "E_AMBIGUOUS_TARGET");
+          this.writeDeliveryFailure(socket, message.id, `Multiple disconnected sessions named \"${destination}\" can receive queued mail. Use the session ID instead.`, "E_AMBIGUOUS_TARGET");
           break;
         }
 
@@ -1171,15 +1235,6 @@ class IntercomBroker {
     this.prunePendingAskRecords(now);
     for (const [messageId, edge] of this.askEdges) {
       if (now - edge.createdAt > this.askTimeoutMs) {
-        this.askEdges.delete(messageId);
-        this.removePendingAskRecord(messageId, edge.scopeId);
-      }
-    }
-  }
-
-  private clearAskEdgesForSession(sessionKey: string): void {
-    for (const [messageId, edge] of this.askEdges) {
-      if (edge.from === sessionKey || edge.to === sessionKey) {
         this.askEdges.delete(messageId);
         this.removePendingAskRecord(messageId, edge.scopeId);
       }
@@ -1693,6 +1748,7 @@ class IntercomBroker {
     console.log("Broker shutting down");
     
     for (const session of this.sessions.values()) {
+      this.clearWatches(session.socket);
       session.socket.end();
     }
     this.sessions.clear();
