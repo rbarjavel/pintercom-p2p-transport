@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { stripVTControlCharacters } from "node:util";
 import { getMarkdownTheme, type ExtensionContext, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
-import { Markdown, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
+import { Markdown, Text, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 
 export interface HistoryMessage {
   id: string;
@@ -11,6 +11,7 @@ export interface HistoryMessage {
   text: string;
   response: boolean;
   peerId: string;
+  attachments: { name: string; type: string; language: string; content: string }[];
 }
 
 const object = (value: unknown): Record<string, unknown> =>
@@ -39,19 +40,25 @@ export function readHistory(entries: readonly unknown[]): HistoryMessage[] {
     const response = Boolean(text(message.replyTo)) || entry.customType === "intercom_received";
     const sender = object(data.from);
     if (text(sender.id)) peers.set(text(sender.id), text(sender.name));
+    const attachments = (Array.isArray(content.attachments) ? content.attachments : []).map(value => {
+      const attachment = object(value);
+      return { name: label(text(attachment.name) || "unnamed"), type: label(text(attachment.type) || "attachment"),
+        language: label(text(attachment.language)), content: clean(text(attachment.content)) };
+    });
     const existing = messages.get(id);
     if (existing) {
       existing.response ||= response;
+      if (!existing.attachments.length) existing.attachments = attachments;
       continue;
     }
     const timestamp = inbound ? message.timestamp : data.timestamp;
-    const attachments = Array.isArray(content.attachments) ? content.attachments : [];
     messages.set(id, {
       id,
       from: direction === "out" ? "local" : label(text(data.from) || text(sender.name) || text(sender.id) || "unknown"),
       to: direction === "in" ? "local" : label(text(data.to) || "unknown"),
       timestamp: typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : Date.parse(text(entry.timestamp)),
-      text: clean(content.text + attachments.map(a => `\n[Attachment: ${text(object(a).name) || "unnamed"}]`).join("")),
+      text: clean(content.text),
+      attachments,
       response,
       peerId: direction === "out" ? text(data.to) : text(sender.id) || text(data.from),
     });
@@ -182,6 +189,8 @@ export class MessageHistoryOverlay implements Component {
         text: `${expanded ? "▾" : "▸"} ${kind} · ${time} · ` }];
       if (!expanded) {
         rows.push({ message, paragraph: 0, char: 0, text: `  ${truncateToWidth(message.text.replace(/\s+/g, " "), Math.max(1, width - 2))}` });
+        if (message.attachments.length) rows.push({ message, paragraph: 1, char: 0,
+          text: `  Attachments (${message.attachments.length}): ${message.attachments.map(a => a.name).join(", ")} · Tab for details` });
       } else {
         const markdown = new Markdown(message.text, 0, 0, getMarkdownTheme(), {
           color: value => this.theme.fg("text", value),
@@ -192,6 +201,16 @@ export class MessageHistoryOverlay implements Component {
           // Ignore whitespace and layout borders so rewrapping doesn't shift the anchor.
           cursor += stripVTControlCharacters(line).replace(/[\s│─┌┐└┘├┤┬┴┼]/g, "").length;
         }
+        message.attachments.forEach((attachment, attachmentIndex) => {
+          const info = [attachment.type, attachment.language, `${Buffer.byteLength(attachment.content)} text bytes`].filter(Boolean).join(" · ");
+          // Render attachment data literally: filenames, evidence and logs are not Markdown instructions.
+          const detail = new Text(`\nAttachment: ${attachment.name} (${info})\n${attachment.content || "[No content recorded]"}`, 0, 0);
+          let cursor = 0;
+          for (const line of detail.render(Math.max(1, width - 2))) {
+            rows.push({ message, paragraph: attachmentIndex + 1, char: cursor, text: `│ ${line}` });
+            cursor += line.replace(/\s/g, "").length;
+          }
+        });
       }
       if (index < this.messages.length - 1) rows.push({ message, paragraph: -2, char: 0, text: "" });
       return rows;

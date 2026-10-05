@@ -101,6 +101,7 @@ The shared key and scope are both used to derive the mDNS service name. Peers wi
 | `PI_INTERCOM_ASK_TIMEOUT_MS` | Ask/reply timeout in milliseconds. Defaults to 1 hour. |
 | `PI_INTERCOM_STABLE_ID` | Optional process-specific stable session ID; takes precedence over `stableId`. |
 | `PI_INTERCOM_P2P_MAX_TRANSFER_BYTES` | Maximum received P2P file transfer size. Defaults to 512 MiB. |
+| `PI_INTERCOM_EVIDENCE_MAX_BYTES` | Maximum retained evidence bytes per scoped intercom session (including metadata). Defaults to 256 MiB. Full stores reject new evidence; nothing is automatically evicted. |
 | `PI_CODING_AGENT_DIR` | Moves the intercom config/runtime directory from `~/.pi/agent`. |
 
 Environment variables are read when the extension starts. Restart affected Pi sessions after changing them.
@@ -117,7 +118,53 @@ Press **Alt+I** or **Cmd+I** (macOS terminals that forward Command via the Kitty
 - **MESSAGE** and **↳ RESPONSE** headers use distinct colors. Previews and ordinary body text use the normal text color. Expanded bodies use Pi’s Markdown renderer for headings, lists, tables, links, and syntax-highlighted fenced code.
 - **Esc**, **Alt+I**, or **Cmd+I** closes the view without changing your draft or stopping agents.
 
-History uses existing session records (including other branches, inherited fork history, and pre-compaction entries), in local recording order. It refreshes every 250 ms while open and works offline with saved history. LIVE means following recorded messages, not proof of delivery or processing. Incoming messages appear once recorded by Pi; timestamps come from the original message/record and may reflect different clocks. Replies are identified by reply metadata or saved ask-waiter records, never inferred from wording. Attachments show names only; exchanges solely between other sessions are not included.
+History uses existing session records (including other branches, inherited fork history, and pre-compaction entries), in local recording order. It refreshes every 250 ms while open and works offline with saved history. LIVE means following recorded messages, not proof of delivery or processing. Incoming messages appear once recorded by Pi; timestamps come from the original message/record and may reflect different clocks. Replies are identified by reply metadata or saved ask-waiter records, never inferred from wording. Collapsed messages show attachment counts and names. Expand with **Tab** to inspect attachment type, language, text size, and recorded contents. File transfers show source paths on the sender and saved locations/file listings on the recipient; evidence attachments show the local evidence ID, reported provenance, coverage and exact excerpt. Sent transfers now retain their attachment details too. Older sent records without transfer metadata cannot reconstruct those details. The view reads saved records only—it does not open transferred files or rerun tools, and recorded paths may no longer exist. Exchanges solely between other sessions are not included.
+
+## Web Monitoring Dashboard (Mobile / LAN)
+
+Monitor all active Pi agents across your local network in real-time from your smartphone or browser:
+
+```bash
+# In any Pi session with intercom:
+/intercom-web
+# or
+/intercom-start-web-ui [port]
+```
+
+To stop the web server:
+```bash
+/intercom-web stop
+# or
+/intercom-stop-web-ui
+```
+
+Features:
+- **Mobile-friendly UI**: Modern, minimalist dark interface displaying every agent discovered on the LAN.
+- **Expandable Agent Cards**: Tap any agent card to inspect the active running command (e.g. bash commands, file paths, tool queries) or the last executed action, with one-tap copy.
+- **Live SSE updates**: Real-time status transitions (`idle`, `thinking`, `tool: <name>`), token context usage gauges, and relative activity times.
+- **Quick Actions**: One-tap copy for `/intercom to:<agent>` handoff, full working directory path, PID, and tmux pane details.
+- **Browser Push Notifications**: Optional web notifications with gentle audio chimes on mobile when an agent finishes thinking or begins running a tool.
+- **Search & Filter**: Instantly filter agents by name, hostname, working directory, model, status, or executed command.
+
+
+## P2P Live Viewer
+
+Set `PI_INTERCOM_P2P_KEY` (at least 16 characters) and optional `PI_INTERCOM_SCOPE_ID` on all participants. P2P agents report telemetry **including message text by default**. Set `PI_INTERCOM_TELEMETRY=0` before starting Pi to disable reporting entirely, or `PI_INTERCOM_TELEMETRY_CONTENT=0` to report metadata without message text. Then run `npm run web` and open `http://<server-LAN-IP>:8787/` (or `http://127.0.0.1:8787/` locally). Override with `npm run web -- --port 9000`; from a project with the package installed, run `./node_modules/.bin/tsx ./node_modules/pi-intercom/p2p/viewer-web.ts --port 9000`. The viewer listens on **0.0.0.0** and has **no HTTP authentication**: anyone who can reach its port can read message text, IDs, and metadata. Use only on a trusted LAN; restrict the port with a firewall and never expose it to the internet. Requests must use the interface's IP address (or `localhost` on loopback), with matching Host and Origin headers to prevent DNS rebinding. It never appears as an agent or message target. The collector discovers agents on the LAN and initiates encrypted, authenticated P2P telemetry streams to them, so the collector's own inbound P2P TCP port need not be reachable from other machines. Agents can also connect to the collector when that port is reachable. Both ends need the same P2P key/scope and running Pi agents need the updated package loaded at startup.
+
+`createViewerServer(observer)` in `p2p/viewer-server.ts` returns an HTTP server. The caller starts/stops `TelemetryObserver` separately and listens on **0.0.0.0**:
+
+```ts
+import { TelemetryObserver } from "./p2p/telemetry.ts";
+import { createViewerServer } from "./p2p/viewer-server.ts";
+
+const observer = new TelemetryObserver();
+const server = createViewerServer(observer);
+await observer.start();
+server.listen(8787, "0.0.0.0"); // open http://<server-LAN-IP>:8787/
+// On shutdown: server.close(); await observer.stop();
+```
+
+`GET /events` streams an initial snapshot and subsequent interaction and layout updates via SSE; `POST /layout`, `POST /layout/group`, and `POST /layout/reset` update the shared board. Agents are framed by hostname; those without a known hostname are hidden from the board but remain in message history. Dragging a frame's title moves its agents together, while individual agents remain movable. The server keeps the latest 1,000 interactions, including separate linked cancellation rows, with up to 16 status updates each; reconnecting receives a fresh snapshot. The UI marks truncated history and dropped sender telemetry. With content reporting enabled (the default), it transmits up to 16 KiB of each message's text over the authenticated telemetry stream and renders a safe Markdown subset in floating conversation windows. Drag agent cards to arrange them, drag empty space to pan, scroll to pan, and Ctrl/⌘+scroll or use toolbar buttons to zoom (25–200%) and fit the graph. Click an agent for all its retained interactions or a connection for both directions of that pair; move and resize multiple conversation windows independently. Keyboard arrows move a focused agent or window title, and resize a focused ↘ control; Escape closes a focused window. Agent positions are shared live across all viewers of this server (last update wins) and reset when the server restarts; Reset layout restores the shared grid for everyone. Camera/zoom stay in each browser's localStorage, while conversation windows remain local and message bodies are not stored there. The graph shows connected reporting agents and agents in collected interactions. A green pulsing border means the agent reports thinking or tool use; idle/unknown agents remain still, and new messages briefly animate their connection. Motion is disabled when the browser requests reduced motion. With `PI_INTERCOM_TELEMETRY_CONTENT=0`, it displays only endpoint metadata, action, status, IDs and attachment names/relative paths/counts. Attachment/file contents are never sent; message text itself may contain sensitive paths or secrets, so keep your key private. Live collection begins when a reporting agent connects; there is no backfill or persistence. Coverage is incomplete when neither endpoint reports (older/opted-out peers), and discovery reaches only peers on the existing LAN-local mDNS network. Do not port-forward this unauthenticated viewer to an untrusted network.
 
 ## P2P Telemetry and Live Viewer
 
@@ -312,6 +359,53 @@ scopes are the access boundary. Session registration/listing advertises
 Requests are capped at 8 KiB, wire replies at 96 KiB, with eight in-flight reads
 per requester and 32 per target (`busy` beyond that), a 10-second transport
 request timeout, cancellation and disconnect/replacement cleanup.
+## Retained tool evidence
+
+When intercom is enabled, text tool results are automatically retained **locally**. Nothing is automatically shared. Results receive an evidence UUID; use `intercom_evidence` to recover them without rerunning the tool:
+
+```typescript
+intercom_evidence({ action: "list", query: "npm test", limit: 10 })
+intercom_evidence({ action: "read", id: "<evidence-uuid>", offset: 180, limit: 30 })
+```
+
+Lookup searches metadata (tool name, tool-call ID, inputs, and received findings), not full output bodies. `offset` is 1-based: result index for `list`, line number for `read`. Lists return at most 50 records; reads return at most 200 lines/16,000 output characters plus bounded provenance. Long lines are marked when clipped; reads normalize line separators. The retained `output.txt` path is also returned for exact byte-level inspection.
+
+### Explicit sharing through intercom
+
+With P2P enabled on both agents, use `evidenceId` on `send`, `ask`, or `reply`:
+
+```typescript
+intercom({
+  action: "send",
+  to: "reviewer",
+  message: "Two tests failed. A cancellation race is a hypothesis, not a confirmed cause.",
+  evidenceId: "<evidence-uuid>",
+  evidenceOffset: 180,
+  evidenceLimit: 20
+})
+```
+
+The harness transfers the selected artifact immediately, without asking the model to reproduce its output. The receiver verifies its hash, commits a local copy under a **new local UUID**, then receives the finding, an exact line excerpt, and a retrieval reference. The finding is limited to 2,000 characters; excerpts are limited to 100 lines/4,000 characters. `evidenceId` cannot be combined with `paths` or inline attachments.
+
+Full outputs stay on disk, not in the peer's context. They remain readable after the sender disconnects or deletes its original. Both peers must support the evidence transfer protocol; older peers fail rather than silently accepting an unusable reference. Like `paths`, evidence sharing requires P2P mode, including between agents on the same machine. Local retention/lookup also work in broker mode and offline.
+
+### Compaction, provenance, and cleanup
+
+Before each model request, a small index of the five latest retained results is rebuilt from disk. This does not replace Pi's compactor or replay entire outputs. Older records remain searchable after repeated compaction, extension reload, or resuming the same session. New sessions/forks have separate stores unless configured with the same stable intercom ID. Evidence from other branches is historical, not proof of the current workspace state.
+
+Artifacts live under `$PI_CODING_AGENT_DIR/intercom/evidence/<scope-and-session-hash>/` (default agent directory: `~/.pi/agent`). Each has `record.json` and `output.txt`, with private directory/file permissions. Metadata includes the source tool invocation, timestamp, branch entry, tool error flag, and Git commit/dirty state sampled after execution—not an atomic filesystem snapshot. Inputs are bounded and marked if shortened. Peer-reported origin is preserved separately from the peer that actually sent the artifact.
+
+Capture preserves the tool's **text projection**, not hidden tool details or images. For built-in `bash`, an available local full-output spill file is copied before it can disappear. Other tools may already have truncated their results; completeness is recorded as reported or unknown. A missing spill file is explicitly marked partial. Evidence reads and intercom messaging are not recursively captured.
+
+Evidence is kept until explicit cleanup:
+
+```typescript
+intercom_evidence({ action: "delete", id: "<evidence-uuid>" })
+```
+
+Deletion affects only this session's local copy, not previously shared copies or the session transcript. Capacity and capture failures are reported without hiding the original tool result or evicting old evidence. Failed transfers do not inject a finding as though its evidence were available. Interrupted-process `.partial-*` directories, if any, can be explicitly removed from the store during maintenance. Temporary transfer storage has its own existing transfer limit.
+
+**Privacy:** outputs and tool inputs can contain secrets. Inspect before sharing; automatic retention is not redaction, and the local cap is per session, not machine-wide. A peer's output is untrusted data—not permission to execute instructions embedded in a log. One runtime must own each intercom session ID; shared-key authentication does not independently attest the claimed original tool execution.
 
 ## Network Requirements
 

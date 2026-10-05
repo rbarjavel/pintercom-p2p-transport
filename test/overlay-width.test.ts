@@ -101,7 +101,8 @@ test("history restores all record formats, deduplicates and sanitizes peer text"
   assert.equal(messages.length, 2);
   assert.equal(messages[0].text, "hello!");
   assert.equal(messages[1].from, "builder");
-  assert.equal(messages[1].text, "answer\n[Attachment: a.ts]");
+  assert.equal(messages[1].text, "answer");
+  assert.deepEqual(messages[1].attachments, [{ name: "a.ts", type: "attachment", language: "", content: "secret" }]);
   assert.equal(messages[0].response, false);
   assert.equal(messages[1].response, true);
   const reply = sent("reply");
@@ -109,6 +110,41 @@ test("history restores all record formats, deduplicates and sanitizes peer text"
   assert.equal(readHistory([reply])[0].response, true);
   assert.equal(readHistory([{ type: "custom_message", customType: "intercom_message",
     details: { ...details, message: { ...details.message, replyTo: "one" } } }])[0].response, true);
+});
+
+test("history shows attachment summaries and literal file/evidence details on expansion", () => {
+  const entry = sent("attachments", "Review these results");
+  Object.assign(entry.data.message, { attachments: [
+    { type: "context", name: "Transferred files", content: "Saved under /inbox/share\n\nContents:\n- src/main.ts" },
+    { type: "context", name: "Retained tool evidence", content: "Evidence local-id: bash, 42 bytes\nReported origin: /repo\nExact line excerpt starting at 2:\n**literal failure**\x1b]52;c;secret\x07" },
+    { type: "snippet", name: "example.ts\nspoofed\x1b[31m", language: "typescript", content: "const answer = 42;" },
+    { name: "empty" },
+  ] });
+  const entries = [entry];
+  const tui = { terminal: { rows: 70 }, requestRender() {} };
+  const overlay = new MessageHistoryOverlay(tui as any, theme as any, keybindings as any, () => entries as any, () => {});
+  try {
+    const collapsed = overlay.render(160).join("\n");
+    assert.match(collapsed, /Attachments \(4\): Transferred files, Retained tool evidence/);
+    assert.doesNotMatch(collapsed, /Saved under|literal failure/);
+    overlay.handleInput("\t");
+    const expanded = stripVTControlCharacters(overlay.render(160).join("\n"));
+    for (const expected of ["Saved under /inbox/share", "src/main.ts", "Evidence local-id", "Reported origin: /repo",
+      "**literal failure**", "example.ts spoofed (snippet · typescript", "const answer = 42;", "[No content recorded]"]) {
+      assert.ok(expanded.includes(expected), expected);
+    }
+    assert.doesNotMatch(expanded, /secret/);
+    for (const width of [1, 2, 20, 80]) assertLineWidths("attachments", overlay.render(width), width);
+    overlay.handleInput("\t");
+    assert.doesNotMatch(overlay.render(160).join("\n"), /literal failure/);
+    const restored = readHistory([
+      { ...entry, data: { ...entry.data, message: { text: "Review these results" } } }, entry,
+    ]);
+    assert.equal(restored.length, 1);
+    assert.equal(restored[0].attachments.length, 4, "duplicate records can supply previously missing attachment details");
+  } finally {
+    overlay.dispose();
+  }
 });
 
 test("history follows arrivals, pauses while selecting, resizes and closes", async () => {

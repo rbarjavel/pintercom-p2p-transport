@@ -1079,7 +1079,8 @@ test("broker disconnects a connection that exceeds the local rate limit", { conc
 
   try {
     raw.socket.on("error", () => undefined);
-    const closed = new Promise<void>(resolve => raw.socket.once("close", resolve));
+    // events.once rejects on ECONNRESET, which is an expected flood-disconnect outcome.
+    const closed = new Promise<void>(resolve => raw.socket.once("close", () => resolve()));
     for (let i = 0; i < 300; i += 1) {
       raw.writeMessage(raw.socket, { type: "list", requestId: `flood-${i}` });
     }
@@ -1780,7 +1781,7 @@ test("lazy tool visibility reveals intercom on bundled skill use only", { concur
 
     try {
       await harness.emitLifecycle("session_start");
-      assert.deepEqual(harness.getActiveTools(), ["read", "bash", "contact_supervisor"]);
+      assert.deepEqual(harness.getActiveTools(), ["read", "bash", "contact_supervisor", "intercom_evidence"]);
 
       harness.pi.events.emit("subagent:control-intercom", {
         to: "session-child-test",
@@ -1806,7 +1807,7 @@ test("lazy tool visibility reveals intercom on bundled skill use only", { concur
         input: { path: path.join(repoDir, "skills", "pi-intercom", "SKILL.md") },
         isError: false,
       });
-      assert.deepEqual(harness.getActiveTools(), ["read", "bash", "contact_supervisor", "intercom"]);
+      assert.deepEqual(harness.getActiveTools(), ["read", "bash", "contact_supervisor", "intercom_evidence", "intercom"]);
 
       await harness.emitLifecycle("session_start");
       assert.equal(harness.getActiveTools().includes("intercom"), false);
@@ -2531,13 +2532,64 @@ test("busy non-interactive sessions auto-reply to top-level asks without abortin
   }
 });
 
+test("intercom routes captured evidence through P2P without copying its output into the message", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { P2PIntercomClient } = await import("./p2p/client.ts");
+  const { EvidenceStore } = await import("./evidence.ts");
+  const previousKey = process.env.PI_INTERCOM_P2P_KEY;
+  process.env.PI_INTERCOM_P2P_KEY = "test-evidence-integration-key";
+  const originalTransfer = P2PIntercomClient.prototype.sendTransfer;
+  let transferred: Parameters<typeof originalTransfer>[1] | undefined;
+  P2PIntercomClient.prototype.sendTransfer = async (_to, options) => {
+    transferred = options;
+    return { id: "evidence-message", delivered: true, delivery: "socket_delivered", retryable: false, outcomeKnown: true, storedAt: "/receiver/inbox/share" };
+  };
+  const harness = createExtensionHarness("evidence-producer", { sessionId: "pi-evidence-session" });
+  try {
+    await withIntercomConfig({ transport: "p2p", stableId: "stable-evidence-producer" }, async () => {
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const patches = await harness.emitLifecycleResults("tool_result", { toolName: "bash", toolCallId: "capture-integration", input: { command: "npm test" },
+        content: [{ type: "text", text: "first\nexact failure\nlast" }], isError: true, details: { truncation: { truncated: false } } });
+      assert.ok(patches.every((patch: any) => !patch?.content), "shell evidence retention must not append a visible notice");
+      const store = new EvidenceStore("stable-evidence-producer");
+      const record = (await store.list("capture-integration")).records[0]!;
+      const tool = harness.tools.find(tool => tool.name === "intercom")!;
+      const result = await tool.execute("share", { action: "send", to: "peer", message: "Possible test issue", evidenceId: record.id, evidenceOffset: 2, evidenceLimit: 1 }, new AbortController().signal, undefined, harness.ctx);
+      assert.equal(result.details?.delivered, true);
+      assert.equal(transferred?.text, "Possible test issue");
+      assert.deepEqual(transferred?.paths, [store.directory(record.id)]);
+      assert.deepEqual(transferred?.evidence, { id: record.id, offset: 2, limit: 1 });
+      assert.equal(transferred?.attachments, undefined);
+      const savedEvidence = (harness.entries.find(entry => entry.type === "intercom_sent")?.data as any).message.attachments[0];
+      assert.equal(savedEvidence.name, "Retained tool evidence");
+      assert.ok(savedEvidence.content.includes(record.id));
+      assert.match(savedEvidence.content, /Exact line excerpt starting at 2:\nexact failure/);
+      assert.doesNotMatch(savedEvidence.content, /first\nexact failure\nlast/);
+      const fileResult = await tool.execute("share-files", { action: "send", to: "peer", message: "Review these files", paths: ["src", "patch.diff"] }, new AbortController().signal, undefined, harness.ctx);
+      assert.equal(fileResult.details?.delivered, true);
+      const savedFiles = (harness.entries.filter(entry => entry.type === "intercom_sent").at(-1)?.data as any).message.attachments[0];
+      assert.equal(savedFiles.name, "Transferred files");
+      assert.ok(savedFiles.content.includes(path.resolve(harness.ctx.cwd, "patch.diff")));
+      assert.match(savedFiles.content, /Saved on recipient under \/receiver\/inbox\/share/);
+      const invalid = await tool.execute("share-invalid", { action: "send", to: "peer", message: "finding", evidenceId: record.id, paths: ["extra.txt"] }, new AbortController().signal, undefined, harness.ctx);
+      assert.match(invalid.content[0].text, /separately/);
+    });
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    P2PIntercomClient.prototype.sendTransfer = originalTransfer;
+    if (previousKey === undefined) delete process.env.PI_INTERCOM_P2P_KEY;
+    else process.env.PI_INTERCOM_P2P_KEY = previousKey;
+  }
+});
+
 test("supervisor tool registers only when child metadata is present", async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
 
   await withChildOrchestratorEnv({}, () => {
     const harness = createExtensionHarness();
     piIntercomExtension(harness.pi as never);
-    assert.deepEqual(harness.tools.map((tool) => tool.name), ["intercom"]);
+    assert.deepEqual(harness.tools.map((tool) => tool.name), ["intercom", "intercom_evidence"]);
   });
 
   await withChildOrchestratorEnv({
@@ -2549,7 +2601,7 @@ test("supervisor tool registers only when child metadata is present", async () =
   }, () => {
     const harness = createExtensionHarness();
     piIntercomExtension(harness.pi as never);
-    assert.deepEqual(harness.tools.map((tool) => tool.name), ["contact_supervisor", "intercom"]);
+    assert.deepEqual(harness.tools.map((tool) => tool.name), ["contact_supervisor", "intercom", "intercom_evidence"]);
     const supervisorTool = harness.tools.find((tool) => tool.name === "contact_supervisor");
     assert.match(JSON.stringify(supervisorTool?.parameters), /interview_request/);
     assert.match(JSON.stringify(supervisorTool?.parameters), /questions/);
@@ -2564,7 +2616,7 @@ test("supervisor tool registers only when child metadata is present", async () =
   }, () => {
     const harness = createExtensionHarness();
     piIntercomExtension(harness.pi as never);
-    assert.deepEqual(harness.tools.map((tool) => tool.name), ["intercom"]);
+    assert.deepEqual(harness.tools.map((tool) => tool.name), ["intercom", "intercom_evidence"]);
   });
 });
 

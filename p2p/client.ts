@@ -1,5 +1,8 @@
 import { EventEmitter } from "node:events";
 import { WATCH_FEATURE, WATCH_TIMEOUT, validateWatchRequest, validWatchResult, watchError, watchDeadline, jsonBytes, type WatchRequest, type WatchResult, type WatchProvider } from "../watch.ts";
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
+import { EvidenceStore, EVIDENCE_TRANSFER_PROTOCOL, parseEvidenceSelection, type EvidenceSelection } from "../evidence.ts";
 import { AgentTelemetry, agentServiceTag, endpoint, observerServiceTag, TELEMETRY_PROTOCOL, projectMessage, type Endpoint, type TelemetryEvent } from "./telemetry.ts";
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { createLibp2p, type Libp2p } from "libp2p";
@@ -56,6 +59,7 @@ interface TransferSendOptions extends SendOptions {
   paths: string[];
   cwd: string;
   signal?: AbortSignal;
+  evidence?: EvidenceSelection;
 }
 
 interface PeerSession {
@@ -101,7 +105,7 @@ type PeerEnvelope =
   | { type: "control"; scopeId?: string; from: SessionInfo; control: MessageControl };
 
 type PeerResponse =
-  | { ok: true; session?: SessionInfo; transferId?: string; storedAt?: string; watch?: WatchResult; requestId?: string; endpointEpoch?: string }
+  | { ok: true; session?: SessionInfo; transferId?: string; storedAt?: string; watch?: WatchResult; requestId?: string; endpointEpoch?: string; evidenceId?: string }
   | { ok: false; reason: string };
 
 type TransferEnvelope = {
@@ -112,6 +116,7 @@ type TransferEnvelope = {
   message: Message;
   transferId: string;
   manifest: TransferManifestEntry[];
+  evidence?: EvidenceSelection;
 };
 
 function toError(error: unknown): Error {
@@ -254,6 +259,10 @@ export class P2PIntercomClient extends EventEmitter {
       maxInboundStreams: 2,
       maxOutboundStreams: 2,
     });
+    await node.handle(EVIDENCE_TRANSFER_PROTOCOL, (stream, connection) => this.handleTransferStream(stream, connection, true), {
+      maxInboundStreams: 2,
+      maxOutboundStreams: 2,
+    });
     mdnsService?.addEventListener("peer", (event) => {
       if (event.detail.id.equals(node.peerId)) return;
       // mDNS can emit a private-only response before our bound-address response.
@@ -364,6 +373,8 @@ export class P2PIntercomClient extends EventEmitter {
     }
     if (!this.registration || !this.node) throw new Error("Not connected");
 
+    const evidence = options.evidence ? parseEvidenceSelection(options.evidence) : undefined;
+    if (evidence && (options.text.length > 2000 || options.attachments?.length)) throw new Error("Evidence sharing requires a finding of at most 2000 characters and no inline attachments");
     const source = await buildTransferSource(options.paths, options.cwd);
     const message: Message = {
       id: messageId,
@@ -387,13 +398,14 @@ export class P2PIntercomClient extends EventEmitter {
       message,
       transferId: messageId,
       manifest: source.manifest,
+      ...(evidence ? { evidence } : {}),
     };
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(new Error("P2P transfer timed out")), 5 * 60_000);
     const signal = options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal;
     let stream: Stream | undefined;
     try {
-      stream = await this.node.dialProtocol(target.peerId, TRANSFER_PROTOCOL, { signal });
+      stream = await this.node.dialProtocol(target.peerId, evidence ? EVIDENCE_TRANSFER_PROTOCOL : TRANSFER_PROTOCOL, { signal });
       const framed = createTransferStream(stream);
       await framed.write(encodeTransferJson(this.sign(envelope)), { signal });
       await sendTransferFiles(framed, source, messageId, (completion) => this.sign(completion), signal);
@@ -402,6 +414,7 @@ export class P2PIntercomClient extends EventEmitter {
       if (!response || typeof response !== "object" || typeof response.ok !== "boolean") throw new Error("Invalid p2p transfer response");
       this.report(() => projectMessage(message, endpoint(this.registration!), endpoint(target.session), response.ok ? "socket_delivered" : "failed", source.manifest, this.telemetryContent));
       if (!response.ok) return { id: messageId, delivered: false, reason: response.reason, delivery: "failed", retryable: true, outcomeKnown: true };
+      if (evidence && typeof response.evidenceId !== "string") throw new Error("Peer did not acknowledge durable evidence storage");
       this.outboundRoutes.set(messageId, target.peerId);
       return { id: messageId, delivered: true, delivery: "socket_delivered", retryable: false, outcomeKnown: true, storedAt: response.storedAt };
     } catch (error) {
@@ -448,13 +461,14 @@ export class P2PIntercomClient extends EventEmitter {
     void this.request(peerId, { type: "receipt", scopeId: this.scopeId, from: this.registration, receipt }).catch(() => undefined);
   }
 
-  updatePresence(updates: { name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null }): void {
+  updatePresence(updates: { name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null; activeToolDetail?: string | null; lastToolDetail?: string | null }): void {
     if (!this.registration) return;
     for (const [key, value] of Object.entries(updates)) {
       if (value === null) Reflect.deleteProperty(this.registration, key);
       else if (value !== undefined) Reflect.set(this.registration, key, value);
     }
     this.registration.lastActivity = Date.now();
+    this.emit("presence_update", this.registration);
     this.telemetry?.emitPresence();
     for (const { peerId } of this.peers.values()) {
       void this.request(peerId, { type: "presence", scopeId: this.scopeId, from: this.registration }).catch(() => undefined);
@@ -583,8 +597,9 @@ export class P2PIntercomClient extends EventEmitter {
     } finally { stream.removeEventListener("close", close); }
   }
 
-  private async handleTransferStream(stream: Stream, connection: Connection): Promise<void> {
+  private async handleTransferStream(stream: Stream, connection: Connection, isEvidence = false): Promise<void> {
     const framed = createTransferStream(stream);
+    let evidenceInbox: string | undefined;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(new Error("P2P transfer timed out")), 5 * 60_000);
     try {
@@ -593,6 +608,19 @@ export class P2PIntercomClient extends EventEmitter {
       const envelope = value as TransferEnvelope;
       if (envelope.type !== "transfer" || envelope.scopeId !== this.scopeId || !isSessionInfo(envelope.from) || envelope.to !== this._sessionId || !isMessage(envelope.message) || envelope.transferId !== envelope.message.id) {
         throw new Error("Invalid p2p transfer header");
+      }
+      if (Boolean(envelope.evidence) !== isEvidence) throw new Error("Evidence requires the evidence transfer protocol");
+      const evidence = isEvidence ? parseEvidenceSelection(envelope.evidence) : undefined;
+      const evidenceStore = new EvidenceStore(this._sessionId!);
+      if (evidence) {
+        const expected = [`${evidence.id}/output.txt`, `${evidence.id}/record.json`];
+        if (envelope.message.content.text.length > 2000 || envelope.message.content.attachments?.length
+          || !Array.isArray(envelope.manifest) || envelope.manifest.length !== 3
+          || envelope.manifest.filter(e => e.path === evidence.id && e.type === "directory").length !== 1
+          || expected.some(path => envelope.manifest.filter(e => e.path === path && e.type === "file").length !== 1)) {
+          throw new Error("Invalid evidence transfer manifest or finding");
+        }
+        await evidenceStore.checkCapacity(envelope.manifest.reduce((total, entry) => total + (entry.size ?? 0), 0));
       }
       const storedAt = await receiveTransferFiles(
         framed,
@@ -607,12 +635,16 @@ export class P2PIntercomClient extends EventEmitter {
         },
         controller.signal,
       );
+      evidenceInbox = evidence ? storedAt : undefined;
+      const record = evidence ? await evidenceStore.import(join(storedAt, evidence.id), evidence.id, envelope.from.id, envelope.message.content.text) : undefined;
       const listed = envelope.manifest.slice(0, 100).map((entry) => `- ${entry.path}`).join("\n");
       const omitted = envelope.manifest.length > 100 ? `\n- ... ${envelope.manifest.length - 100} more entries` : "";
       const attachment: Attachment = {
         type: "context",
-        name: "Transferred files",
-        content: `Saved under ${storedAt}\n\nContents:\n${listed}${omitted}`,
+        name: record ? "Retained tool evidence" : "Transferred files",
+        content: record && evidence
+          ? await evidenceStore.card(record.id, evidence.offset, evidence.limit)
+          : `Saved under ${storedAt}\n\nContents:\n${listed}${omitted}`,
       };
       const message: Message = {
         ...envelope.message,
@@ -623,7 +655,7 @@ export class P2PIntercomClient extends EventEmitter {
       this.remember(this.inboundEndpoints, message.id, endpoint(envelope.from));
       this.report(() => projectMessage(envelope.message, endpoint(envelope.from), endpoint(this.registration!), "receiver_received", envelope.manifest, this.telemetryContent));
       this.emit("message", envelope.from, message);
-      await framed.write(encodeTransferJson(this.sign({ ok: true, transferId: envelope.transferId, storedAt } satisfies PeerResponse)), { signal: controller.signal });
+      await framed.write(encodeTransferJson(this.sign({ ok: true, transferId: envelope.transferId, ...(record ? { evidenceId: record.id } : { storedAt }) } satisfies PeerResponse)), { signal: controller.signal });
       await stream.close();
     } catch (error) {
       try {
@@ -634,6 +666,7 @@ export class P2PIntercomClient extends EventEmitter {
       }
     } finally {
       clearTimeout(timeout);
+      if (evidenceInbox) await rm(evidenceInbox, { recursive: true, force: true });
     }
   }
 

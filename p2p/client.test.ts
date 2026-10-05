@@ -4,7 +4,9 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { confirmP2PListenAddresses, p2pMdnsAnswers, P2PIntercomClient } from "./client.ts";
-import type { SessionRegistration } from "../types.ts";
+import type { Message, SessionRegistration } from "../types.ts";
+import { EvidenceStore, EVIDENCE_TRANSFER_PROTOCOL, type EvidenceOrigin } from "../evidence.ts";
+import { registerEvidence } from "../evidence-extension.ts";
 
 function registration(name: string): SessionRegistration {
   return {
@@ -128,6 +130,94 @@ test("p2p clients stream a folder and deliver its instruction message after comm
     else process.env.PI_INTERCOM_P2P_KEY = previousKey;
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
+});
+
+test("P2P evidence survives sender shutdown, source deletion, compaction and receiver extension restart", async () => {
+  const keys = ["PI_INTERCOM_P2P_KEY", "PI_CODING_AGENT_DIR", "PI_INTERCOM_EVIDENCE_MAX_BYTES"] as const;
+  const previous = keys.map(key => process.env[key]);
+  const root = await mkdtemp(join(tmpdir(), "pi-intercom-evidence-p2p-"));
+  process.env.PI_INTERCOM_P2P_KEY = "test-shared-key-1234";
+  process.env.PI_CODING_AGENT_DIR = root;
+  delete process.env.PI_INTERCOM_EVIDENCE_MAX_BYTES;
+  const sender = new P2PIntercomClient();
+  const receiver = new P2PIntercomClient();
+  try {
+    const source = new EvidenceStore("sender-evidence");
+    const origin: EvidenceOrigin = { sessionId: "sender-evidence", toolCallId: "large-test-log", toolName: "bash", cwd: "/sender/repo",
+      timestamp: Date.now(), workspace: "abc123; dirty", input: "npm test", isError: true, coverage: "full-output-file", truncated: false, omittedNonText: false };
+    const text = Array.from({ length: 60_000 }, (_, i) => `${i + 1}: ${i === 30_000 ? "EXACT MIDDLE FAILURE" : "normal output"} ${"x".repeat(100)}`).join("\n");
+    const record = await source.retain(origin, { text });
+    assert.ok(record.bytes > 5 * 1024 * 1024);
+    await sender.connect(registration("sender"), "sender-evidence");
+    await receiver.connect(registration("receiver"), "receiver-evidence");
+    await wirePair(sender, receiver);
+    const received = new Promise<Message>(resolve => receiver.once("message", (_from, message) => resolve(message)));
+    const result = await sender.sendTransfer("receiver-evidence", { text: "Cancellation may be responsible; unconfirmed.", paths: [source.directory(record.id)], cwd: root,
+      evidence: { id: record.id, offset: 30_001, limit: 2 } });
+    assert.equal(result.delivered, true);
+    const message = await received;
+    const card = message.content.attachments![0]!.content;
+    assert.match(card, /EXACT MIDDLE FAILURE/);
+    assert.ok(card.length < 6000, "full multi-megabyte output must not enter model context");
+    assert.ok(!card.includes(source.directory(record.id)), "recipient uses its own reference, not the sender's path");
+    await sender.disconnect();
+    await source.delete(record.id);
+    await receiver.disconnect();
+    const resumed = new EvidenceStore("receiver-evidence");
+    const imported = (await resumed.list("Cancellation")).records[0]!;
+    assert.deepEqual(imported.origin, origin);
+    assert.equal(imported.sha256, record.sha256);
+    assert.equal((await resumed.read(imported.id, 30_001, 1)).text, text.split("\n")[30_000]);
+    for (let i = 0; i < 2; i++) {
+      let contextHook: Function = () => undefined;
+      registerEvidence({ registerTool: () => undefined, on: (name: string, handler: Function) => { if (name === "context") contextHook = handler; } } as never,
+        () => "receiver-evidence");
+      const context = await contextHook({ messages: [{ role: "compactionSummary", summary: "Compacted", tokensBefore: 100000, timestamp: 1 }] }, {});
+      assert.match(context.messages.at(-1).content, new RegExp(imported.id));
+    }
+    await resumed.delete(imported.id);
+    assert.equal((await resumed.list()).total, 0);
+  } finally {
+    await Promise.allSettled([sender.disconnect(), receiver.disconnect()]);
+    keys.forEach((key, index) => { if (previous[index] === undefined) delete process.env[key]; else process.env[key] = previous[index]; });
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("P2P rejects evidence when storage is full or the peer lacks evidence support", async () => {
+  const keys = ["PI_INTERCOM_P2P_KEY", "PI_CODING_AGENT_DIR", "PI_INTERCOM_EVIDENCE_MAX_BYTES"] as const;
+  const previous = keys.map(key => process.env[key]);
+  const root = await mkdtemp(join(tmpdir(), "pi-intercom-evidence-reject-"));
+  process.env.PI_INTERCOM_P2P_KEY = "test-shared-key-1234";
+  process.env.PI_CODING_AGENT_DIR = root;
+  delete process.env.PI_INTERCOM_EVIDENCE_MAX_BYTES;
+  const sender = new P2PIntercomClient();
+  const receiver = new P2PIntercomClient();
+  try {
+    const source = new EvidenceStore("sender-evidence");
+    const record = await source.retain({ sessionId: "sender-evidence", toolCallId: "test", toolName: "bash", cwd: root, timestamp: Date.now(), workspace: "unknown",
+      input: "test", isError: false, coverage: "tool-result", truncated: false, omittedNonText: false }, { text: "output" });
+    await sender.connect(registration("sender"), "sender-evidence");
+    await receiver.connect(registration("receiver"), "receiver-evidence");
+    await wirePair(sender, receiver);
+    let delivered = 0;
+    receiver.on("message", () => delivered++);
+    const options = { text: "finding", paths: [source.directory(record.id)], cwd: root, evidence: { id: record.id, offset: 1, limit: 2 } };
+    process.env.PI_INTERCOM_EVIDENCE_MAX_BYTES = "1";
+    const result = await sender.sendTransfer("receiver-evidence", options);
+    assert.equal(result.delivered, false);
+    assert.match(result.reason!, /storage limit/);
+    assert.equal(delivered, 0);
+    assert.equal((await new EvidenceStore("receiver-evidence").list()).total, 0);
+    delete process.env.PI_INTERCOM_EVIDENCE_MAX_BYTES;
+    await Reflect.get(receiver, "node").unhandle(EVIDENCE_TRANSFER_PROTOCOL);
+    await assert.rejects(sender.sendTransfer("receiver-evidence", options));
+    assert.equal(delivered, 0);
+  } finally {
+    await Promise.allSettled([sender.disconnect(), receiver.disconnect()]);
+    keys.forEach((key, index) => { if (previous[index] === undefined) delete process.env[key]; else process.env[key] = previous[index]; });
+    await rm(root, { recursive: true, force: true });
   }
 });
 

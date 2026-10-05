@@ -1,10 +1,15 @@
+import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
-import type { Libp2p } from "libp2p";
+import { createLibp2p, type Libp2p } from "libp2p";
+import { tcp } from "@libp2p/tcp";
+import { mdns } from "@libp2p/mdns";
+import { noise } from "@chainsafe/libp2p-noise";
+import { yamux } from "@chainsafe/libp2p-yamux";
 import type { PeerId, Stream } from "@libp2p/interface";
 import { getIntercomScopeId } from "../config.ts";
 import type { Attachment, Message, SessionInfo } from "../types.ts";
 import type { TransferManifestEntry } from "./transfer.ts";
-import { MAX_FRAME, MAX_TELEMETRY_BODY_BYTES, TELEMETRY_PROTOCOL, telemetryKey, sign, verify, framed, writeFrame, readFrame, validTodos, type TodoSnapshot, type Endpoint, type TelemetryPresence, type TelemetryTodo, type TelemetryEvent } from "./telemetry-contract.ts";
+import { MAX_FRAME, MAX_TELEMETRY_BODY_BYTES, TELEMETRY_PROTOCOL, telemetryKey, sign, verify, framed, writeFrame, readFrame, validTodos, validEndpoint, onlyKeys, agentServiceTag, observerServiceTag, validTelemetryEvent, type TodoSnapshot, type Endpoint, type TelemetryPresence, type TelemetryTodo, type TelemetryEvent } from "./telemetry-contract.ts";
 export { agentServiceTag, observerServiceTag, TELEMETRY_PROTOCOL, MAX_TELEMETRY_BODY_BYTES, validTelemetryEvent } from "./telemetry-contract.ts";
 export type { Endpoint, TelemetryPresence, TelemetryTodo, TelemetryEvent } from "./telemetry-contract.ts";
 const text = new TextEncoder();
@@ -162,5 +167,97 @@ export class AgentTelemetry {
     this.retries.clear();
     for (const { stream } of this.observers.values()) stream.abort(new Error("Telemetry stopped"));
     this.observers.clear();
+  }
+}
+
+/** Observer is not registered as an intercom session; it dials agents and accepts older agents dialing it. */
+export class TelemetryObserver extends EventEmitter {
+  private readonly key = telemetryKey();
+  private readonly scope = getIntercomScopeId();
+  private readonly connecting = new Set<string>();
+  private readonly active = new Set<string>();
+  node: Libp2p | null = null;
+  async start(): Promise<void> {
+    if (this.node) throw new Error("Observer already started");
+    const tag = observerServiceTag(this.key, this.scope);
+    const createMdns = mdns({ serviceTag: tag });
+    const discoverAgents = mdns({ serviceTag: agentServiceTag(this.key, this.scope), broadcast: false });
+    let discovery: ReturnType<typeof createMdns> | undefined;
+    let agentDiscovery: ReturnType<typeof discoverAgents> | undefined;
+    const node = await createLibp2p({ start: false, addresses: { listen: ["/ip4/0.0.0.0/tcp/0"] }, transports: [tcp()], connectionEncrypters: [noise()], streamMuxers: [yamux()], peerDiscovery: [
+      (components) => { discovery = createMdns(components); return discovery; },
+      (components) => { agentDiscovery = discoverAgents(components); return agentDiscovery; },
+    ] });
+    this.node = node;
+    await node.handle(TELEMETRY_PROTOCOL, (stream, connection) => this.handle(stream, connection.remotePeer), { maxInboundStreams: 64, maxOutboundStreams: 64 });
+    agentDiscovery?.addEventListener("peer", (event) => {
+      if (event.detail.id.equals(node.peerId)) return;
+      void node.peerStore.merge(event.detail.id, { multiaddrs: event.detail.multiaddrs })
+        .then(() => this.subscribe(event.detail.id)).catch(() => undefined);
+    });
+    await node.start();
+    // Advertise the actual bound TCP addresses, including LAN public-range subnets.
+    const components = (node as Libp2p & { components: { transportManager: { getAddrs(): ReturnType<Libp2p["getMultiaddrs"]> }; addressManager: { confirmObservedAddr(addr: ReturnType<Libp2p["getMultiaddrs"]>[number], options: { type: "transport" }): void } } }).components;
+    for (const addr of components.transportManager.getAddrs()) components.addressManager.confirmObservedAddr(addr, { type: "transport" });
+    // The mDNS implementation exposes its socket, though PeerDiscovery's interface omits it.
+    const socket = (discovery as typeof discovery & { mdns?: { on(event: "query", handler: (query: { questions: Array<{ name: string; type: string }> }) => void): void; respond(answers: Array<{ name: string; type: "PTR" | "TXT"; class: "IN"; ttl: number; data: string }>): void } } | undefined)?.mdns;
+    socket?.on("query", (query) => {
+      if (query.questions.some(({ name, type }) => name === tag && type === "PTR")) {
+        const instance = `${node.peerId.toString()}.${tag}`;
+        socket.respond([{ name: tag, type: "PTR", class: "IN", ttl: 120, data: instance }, ...node.getMultiaddrs().map((addr) => ({ name: instance, type: "TXT" as const, class: "IN" as const, ttl: 120, data: `dnsaddr=${addr.toString()}` }))]);
+      }
+    });
+  }
+  async stop(): Promise<void> { const node = this.node; this.node = null; await node?.stop(); this.connecting.clear(); this.active.clear(); }
+  private async subscribe(peerId: PeerId): Promise<void> {
+    const node = this.node, id = peerId.toString();
+    if (!node || this.connecting.has(id) || this.active.has(id) || this.connecting.size + this.active.size >= 64) return;
+    this.connecting.add(id);
+    let stream: Stream | undefined;
+    try {
+      stream = await node.dialProtocol(peerId, TELEMETRY_PROTOCOL, { signal: AbortSignal.timeout(5_000) });
+      const frame = framed(stream);
+      await writeFrame(frame, sign(this.key, { type: "subscribe", version: 1, scope: this.scope, observerPeerId: node.peerId.toString() }));
+      const response = verify(this.key, await readFrame(frame, AbortSignal.timeout(5_000))) as { type?: string; scope?: string; reporter?: Endpoint & { peerId?: string } };
+      if (response.type !== "subscribed" || response.scope !== this.scope || !validEndpoint(response.reporter) || response.reporter?.peerId !== id) throw new Error("Invalid agent subscription");
+      await this.consume(frame, stream, peerId, response.reporter as Endpoint & { peerId: string });
+    } catch { stream?.abort(new Error("Telemetry connection failed")); }
+    finally { this.connecting.delete(id); }
+  }
+  private async handle(stream: Stream, peerId: PeerId): Promise<void> {
+    try {
+      const frame = framed(stream);
+      const hello = verify(this.key, await readFrame(frame, AbortSignal.timeout(5_000))) as { type?: string; version?: number; scope?: string; reporter?: Endpoint & { peerId?: string } };
+      if (hello.type !== "subscribe" || hello.version !== 1 || hello.scope !== this.scope || !validEndpoint(hello.reporter) || hello.reporter?.peerId !== peerId.toString()) throw new Error("Invalid telemetry subscription");
+      await writeFrame(frame, sign(this.key, { type: "subscribed", scope: this.scope }));
+      await this.consume(frame, stream, peerId, hello.reporter as Endpoint & { peerId: string });
+    } catch { stream.abort(new Error("Telemetry subscription rejected")); }
+  }
+  private async consume(frame: ReturnType<typeof framed>, stream: Stream, peerId: PeerId, reporter: Endpoint & { peerId: string }): Promise<void> {
+    const id = peerId.toString();
+    if (this.active.has(id) || this.active.size >= 64) { stream.abort(new Error("Duplicate telemetry connection")); return; }
+    this.active.add(id);
+    this.emit("status", { connected: true, reporter });
+    try {
+      for (;;) {
+        const payload = verify(this.key, await readFrame(frame)) as { type?: string; scope?: string; event?: unknown; presence?: TelemetryPresence; todo?: TelemetryTodo & { type?: string }; dropped?: number };
+        if (payload.type === "presence") {
+          const presence = payload.presence;
+          if (payload.scope !== this.scope || !presence || !onlyKeys(presence, ["reporter", "active"]) || !validEndpoint(presence.reporter) || presence.reporter.peerId !== reporter.peerId || presence.reporter.id !== reporter.id || presence.reporter.epoch !== reporter.epoch || typeof presence.active !== "boolean") throw new Error("Invalid telemetry presence");
+          this.emit("presence", presence);
+          continue;
+        }
+        if (payload.type === "todo") {
+          const todo = payload.todo;
+          if (payload.scope !== this.scope || !todo || todo.type !== "todo" || !validEndpoint(todo.reporter) || todo.reporter.peerId !== reporter.peerId || todo.reporter.id !== reporter.id || todo.reporter.epoch !== reporter.epoch || !validTodos(todo.snapshot)) throw new Error("Invalid telemetry todo");
+          this.emit("todo", todo);
+          continue;
+        }
+        if (payload.type !== "event" || payload.scope !== this.scope || !validTelemetryEvent(payload.event, reporter) || !Number.isSafeInteger(payload.dropped) || payload.dropped! < 0) throw new Error("Invalid telemetry event");
+        this.emit("event", payload.event);
+        if (payload.dropped) this.emit("status", { partial: true, dropped: payload.dropped });
+      }
+    } catch { /* malformed or disconnected streams are not trusted */ }
+    finally { stream.abort(new Error("Telemetry closed")); this.active.delete(id); this.emit("status", { connected: false, peerId: id }); }
   }
 }

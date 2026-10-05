@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P2P agent board</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #000000; --panel: #0a0a0a; --subpanel: #111111; --border: #222222;
+  --border-focus: #38bdf8; --text-main: #f1f5f9; --text-muted: #64748b; --text-dim: #475569;
+  --green: #22c55e; --red: #ef4444; --cyan: #38bdf8; --orange: #f59e0b;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font: 14px var(--font-sans); background: var(--bg); color: var(--text-main);
+}
+* { box-sizing:border-box; } body { margin:0; display:flex; flex-direction:column; height:100dvh; } button { cursor:pointer; } button:focus-visible, [tabindex]:focus-visible, summary:focus-visible { outline:2px solid var(--border-focus); outline-offset:2px; }
+header { display:flex; align-items:center; flex-wrap:wrap; gap:.6rem; padding:.6rem; background:var(--panel); border-bottom:1px solid var(--border); } h1 { margin:0 .5rem 0 0; font-size:1.2rem; } header button, .window button { background:var(--subpanel); color:var(--text-main); border:1px solid var(--border); border-radius:5px; padding:.3rem .5rem; } header button:hover, .window button:hover { border-color:var(--border-focus); } #connection { color:var(--orange); } #connection.live { color:var(--green); } #notice { color:var(--orange); } #count { white-space:nowrap; color:var(--text-muted); }
+#board { position:relative; flex:1; min-height:0; overflow:hidden; cursor:grab; touch-action:none; background-color:var(--bg); background-image:radial-gradient(var(--border) 1px,transparent 1px); background-size:24px 24px; } #board.panning { cursor:grabbing; }
+#world { position:absolute; left:0; top:0; transform-origin:0 0; } #groups { position:absolute; left:0; top:0; } .machine-frame { position:absolute; border:1px solid var(--text-dim); border-radius:12px; background:var(--panel); pointer-events:none; } .machine-title { pointer-events:auto; position:absolute; top:0; left:0; right:0; width:100%; height:34px; padding:0 12px; border:0; border-bottom:1px solid var(--border); border-radius:12px 12px 0 0; background:var(--subpanel); color:var(--text-main); font:600 13px var(--font-mono); text-align:left; cursor:grab; touch-action:none; } .machine-title:hover,.machine-title:focus-visible { color:var(--cyan); } .machine-title.dragging { cursor:grabbing; } #edges { position:absolute; left:0; top:0; width:1px; height:1px; overflow:visible; pointer-events:none; } .edge { pointer-events:stroke; cursor:pointer; } .edge path.hit { stroke:transparent; stroke-width:22; fill:none; } .edge path.visible { stroke:var(--text-muted); stroke-width:2; fill:none; pointer-events:none; } .edge:hover path.visible,.edge:focus path.visible { stroke:var(--text-main); stroke-width:4; } .edge.sending path.visible { stroke:var(--orange); stroke-dasharray:10 8; animation:message-flow .7s linear infinite; } .edge text { fill:var(--text-main); font:12px var(--font-mono); text-anchor:middle; pointer-events:none; paint-order:stroke; stroke:var(--bg); stroke-width:5px; stroke-linejoin:round; }
+.agent { position:absolute; width:190px; min-height:70px; padding:10px; border:1px solid var(--text-muted); border-radius:12px; background:var(--subpanel); color:var(--text-main); text-align:center; overflow-wrap:anywhere; box-shadow:0 0 0 1px var(--border), 0 6px 20px #000c; touch-action:none; cursor:grab; } .agent:hover,.agent:focus-visible { border-color:var(--border-focus); } .agent.working { border-color:var(--green); animation:working-glow 2s ease-in-out infinite; } .agent.dragging { cursor:grabbing; } .agent strong,.agent small { display:block; } .agent strong { font-size:1.05rem; } .agent small { color:var(--text-muted); font-family:var(--font-mono); margin-top:4px; }
+#window-layer { position:absolute; inset:0; pointer-events:none; overflow:hidden; } .window { position:absolute; pointer-events:auto; display:flex; flex-direction:column; min-width: min(320px,100%); min-height:min(220px,100%); resize:both; overflow:hidden; border:1px solid var(--border-focus); border-radius:9px; background:var(--panel); box-shadow:0 10px 36px #000b; } .window-bar { flex:none; display:flex; align-items:center; gap:.4rem; padding:.4rem; background:var(--subpanel); cursor:move; touch-action:none; } .window-bar strong { flex:1; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; } .window-bar button { cursor:pointer; } .window-body { flex:1; min-height:0; overflow:auto; padding:.7rem; overflow-wrap:anywhere; } .window .new { align-self:flex-end; margin:.3rem; } [hidden] { display:none !important; }
+.message { border-bottom:1px solid var(--border); padding:.5rem 0; } .message:target { background:var(--subpanel); } .message h3 { font-size:.95rem; margin:0 0 .3rem; } .message small { color:var(--text-muted); font-family:var(--font-mono); } .markdown { line-height:1.5; } .markdown h1,.markdown h2,.markdown h3 { margin:.7em 0 .35em; } .markdown h1 { font-size:1.4rem; } .markdown h2 { font-size:1.2rem; } .markdown p { margin:.5em 0; } .markdown pre { overflow:auto; padding:.75rem; border-radius:6px; background:var(--bg); } .markdown code { padding:.1em .3em; border-radius:3px; background:var(--subpanel); } .markdown pre code { padding:0; background:transparent; } .markdown blockquote { margin:.5em 0; padding-left:.8rem; border-left:3px solid var(--text-dim); } .markdown a { color:var(--cyan); } .note { color:var(--orange); } details { margin:.5rem 0; } .window li { margin:.25rem 0; }
+#help { position:absolute; bottom:8px; left:8px; background:var(--panel); color:var(--text-muted); padding:5px; pointer-events:none; } #list-panel { position:absolute; right:8px; bottom:8px; max-width:min(400px,90%); max-height:35%; overflow:auto; background:var(--panel); border:1px solid var(--border); pointer-events:auto; padding:.4rem; } #list-panel button { color:var(--text-main); background:none; border:0; text-align:left; } #list-panel button:hover { color:var(--cyan); text-decoration:underline; }
+@keyframes working-glow { 50% { box-shadow:0 0 0 2px var(--green), 0 0 18px #22c55e66; } }
+@keyframes message-flow { to { stroke-dashoffset:-18; } }
+@media (prefers-reduced-motion:reduce) { .agent.working,.edge.sending path.visible { animation:none; } }
+@media (max-width:700px) { #help { max-width:50%; } }
+</style>
+</head>
+<body>
+<header><h1>P2P agent board</h1><span id="connection" role="status">Connecting…</span><span id="count">0 interactions</span><span id="notice" role="status">Partial coverage: older or opted-out agents may not report.</span><button id="zoom-in" aria-label="Zoom in">+</button><button id="zoom-out" aria-label="Zoom out">−</button><button id="zoom-reset">100%</button><button id="fit">Fit agents</button><button id="layout-reset">Reset layout</button></header>
+<main id="board" aria-label="Interactive agent board"><div id="world"><div id="groups"></div><svg id="edges" aria-label="Agent connections"></svg><div id="agents"></div></div><div id="window-layer"></div><div id="help">Drag agents or machine headers to arrange · drag background to pan · scroll to pan · Ctrl/⌘+scroll to zoom · click agents or connections for history</div><details id="list-panel"><summary>Interactions (text)</summary><ol id="text-events" aria-label="Chronological interaction list"></ol></details></main>
+<script>
+const $ = selector => document.querySelector(selector);
+const board = $('#board'), world = $('#world'), groupLayer = $('#groups'), edges = $('#edges'), agents = $('#agents'), layer = $('#window-layer');
+const items = new Map(), presence = new Map(), positions = new Map(), cards = new Map(), lines = new Map(), windows = new Map(), groups = new Map(), machineOf = new Map();
+const laneKey = peer => JSON.stringify([peer.id, peer.epoch]);
+const machineKey = peer => peer.hostname?.trim().toLowerCase() || `unknown:${laneKey(peer)}`;
+const pairKey = (a,b) => JSON.stringify([a,b].sort());
+const pairMembers = key => { try { const members=JSON.parse(key); return Array.isArray(members) && members.length===2 ? members : []; } catch { return []; } };
+const label = peer => `${peer.name || 'Agent'} (${peer.id.slice(0,8)})`;
+const NS = 'http://www.w3.org/2000/svg', storageKey = 'pi-intercom-board-v1';
+let x = 60, y = 60, zoom = 1, topZ = 2, partial = false, truncated = false, connected = 0, moving = null, painting = false;
+function save() { try { localStorage.setItem(storageKey, JSON.stringify({ x,y,zoom })); } catch {} }
+try {
+  const state = JSON.parse(localStorage.getItem(storageKey) || '{}');
+  if (Number.isFinite(state.x) && Math.abs(state.x) < 1e6) x = state.x;
+  if (Number.isFinite(state.y) && Math.abs(state.y) < 1e6) y = state.y;
+  if (Number.isFinite(state.zoom) && state.zoom >= .25 && state.zoom <= 2) zoom = state.zoom;
+} catch {}
+function camera() { world.style.transform = `translate(${x}px,${y}px) scale(${zoom})`; save(); }
+const posting = new Map(), layoutVersions = new Map();
+function acceptPosition(key,position,revision=0) {
+  if (revision < (layoutVersions.get(key) || 0) || moving?.key===key || moving?.group===machineOf.get(key)) return;
+  positions.set(key,position); layoutVersions.set(key,revision);
+}
+function moveGroup(machine,dx,dy) {
+  for (const [key,[px,py]] of positions) if (machineOf.get(key)===machine) positions.set(key,[px+dx,py+dy]);
+  paint();
+}
+async function publishGroup(machine,dx,dy) {
+  if (!dx && !dy) return;
+  try {
+    const response=await fetch('/layout/group',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({machine,dx,dy})});
+    if (!response.ok) throw new Error('Group movement failed');
+    const data=await response.json();
+    for (const [key,position] of data.moved) acceptPosition(key,position,data.revision);
+    paint();
+  } catch { $('#notice').textContent='Could not synchronize machine positions. Reload to restore the shared layout.'; }
+}
+function publishPosition(key,final=false) {
+  const position=positions.get(key); if (!position) return;
+  let state=posting.get(key);
+  if (!state) { state={latest:null,busy:false,timer:null}; posting.set(key,state); }
+  state.latest=[...position];
+  if (state.busy) return;
+  if (state.timer) { if (final) { clearTimeout(state.timer); state.timer=setTimeout(()=>flushPosition(key,state),0); } return; }
+  state.timer=setTimeout(()=>flushPosition(key,state),final ? 0 : 50);
+}
+async function flushPosition(key,state) {
+  state.timer=null; state.busy=true;
+  const [x,y]=state.latest; state.latest=null;
+  try { const result=await fetch('/layout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,x,y})}); if (!result.ok) throw new Error('Layout update failed'); }
+  catch { $('#notice').textContent='Could not synchronize agent positions.'; }
+  finally { state.busy=false; if (state.latest) publishPosition(key,true); else posting.delete(key); }
+}
+function setZoom(value,cx = board.clientWidth/2,cy = board.clientHeight/2) { const next = Math.max(.25,Math.min(2,value)); x = cx-(cx-x)*next/zoom; y = cy-(cy-y)*next/zoom; zoom = next; camera(); }
+function fit() { const points = [...cards.keys()].map(key=>positions.get(key)).filter(Boolean); if (!points.length) return; const minX = Math.min(...points.map(p=>p[0]))-30, maxX = Math.max(...points.map(p=>p[0]+190))+30, minY = Math.min(...points.map(p=>p[1]))-55, maxY = Math.max(...points.map(p=>p[1]+80))+30; zoom = Math.max(.25,Math.min(2,Math.min((board.clientWidth-60)/(maxX-minX),(board.clientHeight-60)/(maxY-minY)))); x=(board.clientWidth-(maxX+minX)*zoom)/2; y=(board.clientHeight-(maxY+minY)*zoom)/2; camera(); }
+function paint() { if (painting) return; painting=true; requestAnimationFrame(() => { painting=false; const coords=[...cards.keys()].map(key=>positions.get(key)).filter(Boolean); if (coords.length) { const left=Math.min(...coords.map(p=>p[0]))-140,top=Math.min(...coords.map(p=>p[1]))-140,right=Math.max(...coords.map(p=>p[0]+190))+140,bottom=Math.max(...coords.map(p=>p[1]+80))+140; edges.style.left=`${left}px`; edges.style.top=`${top}px`; edges.style.width=`${right-left}px`; edges.style.height=`${bottom-top}px`; edges.setAttribute('viewBox',`${left} ${top} ${right-left} ${bottom-top}`); } for (const [machine,frame] of groups) { const members=[...positions].filter(([key])=>machineOf.get(key)===machine).map(([,position])=>position); if (!members.length) continue; const minX=Math.min(...members.map(p=>p[0])),maxX=Math.max(...members.map(p=>p[0]+190)),minY=Math.min(...members.map(p=>p[1])),maxY=Math.max(...members.map(p=>p[1]+80)); frame.style.left=`${minX-30}px`; frame.style.top=`${minY-55}px`; frame.style.width=`${maxX-minX+60}px`; frame.style.height=`${maxY-minY+85}px`; } for (const [key,card] of cards) { const [px,py]=positions.get(key); card.style.left=`${px}px`; card.style.top=`${py}px`; } for (const [key,line] of lines) { const [a,b]=pairMembers(key), [ax,ay]=positions.get(a), [bx,by]=positions.get(b); const cx=ax+95,cy=ay+40,tx=bx+95,ty=by+40,dx=tx-cx,dy=ty-cy,ratio=Math.min(95/Math.max(1,Math.abs(dx)),40/Math.max(1,Math.abs(dy))); const startX=cx+dx*ratio,startY=cy+dy*ratio,endX=tx-dx*ratio,endY=ty-dy*ratio; const path=a===b ? `M${cx+40} ${cy-30} C${cx+125} ${cy-105} ${cx-125} ${cy-105} ${cx-40} ${cy-30}` : `M${startX} ${startY} L${endX} ${endY}`; line.querySelectorAll('path').forEach(p=>p.setAttribute('d',path)); const text=line.querySelector('text'); text.setAttribute('x',(startX+endX)/2); text.setAttribute('y',a===b ? startY-95 : (startY+endY)/2-9); } }); }
+function notice() { $('#notice').textContent = `${connected ? '' : 'No connected reporters. '}Partial coverage: older/opted-out agents do not report${partial ? '; telemetry dropped' : ''}${truncated ? '; history limited to 1,000' : ''}. No backfill or persistence of messages.`; }
+function link(labelText,id) { const button=document.createElement('button'); button.textContent=labelText; button.addEventListener('click',()=> { const target=[...items.values()].find(item=>item.messageId===id && item.action!=='cancel'); if (target) { openWindow('pair',pairKey(laneKey(target.from),laneKey(target.to))); focusMessage(target.id); } else $('#notice').textContent='Message not in retained history.'; }); return button; }
+function renderInline(source,parent) {
+  const tokens=/`([^`\n]+)`|\*\*([^*\n]+)\*\*|\*([^*\n]+)\*|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g;
+  let start=0;
+  for (const match of source.matchAll(tokens)) {
+    parent.append(document.createTextNode(source.slice(start,match.index)));
+    let node;
+    if (match[1]) { node=document.createElement('code'); node.textContent=match[1]; }
+    else if (match[2]) { node=document.createElement('strong'); node.textContent=match[2]; }
+    else if (match[3]) { node=document.createElement('em'); node.textContent=match[3]; }
+    else { node=document.createElement('a'); node.textContent=match[4]; try { const url=new URL(match[5]); if (url.protocol==='http:' || url.protocol==='https:') { node.href=url.href; node.rel='noopener noreferrer'; node.target='_blank'; } } catch {} }
+    parent.append(node); start=match.index+match[0].length;
+  }
+  parent.append(document.createTextNode(source.slice(start)));
+}
+function renderMarkdown(source,parent) {
+  const lines=source.replace(/\r\n?/g,'\n').split('\n'); let paragraph=[],list=null,code=null;
+  const flush=()=> { if (paragraph.length) { const p=document.createElement('p'); renderInline(paragraph.join(' '),p); parent.append(p); paragraph=[]; } list=null; };
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) { if (code) { const pre=document.createElement('pre'),content=document.createElement('code'); content.textContent=code.join('\n'); pre.append(content); parent.append(pre); code=null; } else { flush(); code=[]; } continue; }
+    if (code) { code.push(line); continue; }
+    if (!line.trim()) { flush(); continue; }
+    const heading=line.match(/^\s{0,3}(#{1,6})\s+(.+)$/);
+    if (heading) { flush(); const h=document.createElement(`h${heading[1].length}`); renderInline(heading[2],h); parent.append(h); continue; }
+    const item=line.match(/^\s{0,3}([-*+]|\d+\.)\s+(.+)$/);
+    if (item) { if (paragraph.length) flush(); const type=/\d/.test(item[1][0])?'ol':'ul'; if (!list || list.localName!==type) { list=document.createElement(type); parent.append(list); } const li=document.createElement('li'); renderInline(item[2],li); list.append(li); continue; }
+    if (line.startsWith('> ')) { flush(); const quote=document.createElement('blockquote'); renderInline(line.slice(2),quote); parent.append(quote); continue; }
+    list=null; paragraph.push(line);
+  }
+  if (code) { const pre=document.createElement('pre'),content=document.createElement('code'); content.textContent=code.join('\n'); pre.append(content); parent.append(pre); } flush();
+}
+function matches(item,type,key) { return type==='agent' ? [item.from,item.to].some(p=>laneKey(p)===key) : pairKey(laneKey(item.from),laneKey(item.to))===key; }
+function message(item) {
+  const entry=document.createElement('article'); entry.className='message'; entry.dataset.id=item.id;
+  const title=document.createElement('h3'); title.textContent=`${label(item.from)} → ${label(item.to)} · intercom.${item.action} · ${item.status}`;
+  const date=document.createElement('small'); date.textContent=`${new Date(item.timestamp).toLocaleString()} (sender clock may differ) · ${item.messageId}`;
+  const body=document.createElement('div'); body.className='markdown';
+  if (item.body===undefined) body.textContent='Message text unavailable (older agent, opt-out, or no backfill).';
+  else if (!item.body) body.textContent='(Empty message)';
+  else renderMarkdown(item.body,body);
+  if (item.bodyTruncated) { const note=document.createElement('p'); note.className='note'; note.textContent='Message text truncated by telemetry or snapshot limits.'; body.append(note); }
+  const more=document.createElement('details'),summary=document.createElement('summary'); summary.textContent='Observations and metadata'; more.append(summary);
+  const meta=document.createElement('div'); meta.textContent=`From: ${item.from.id}, epoch ${item.from.epoch}\nTo: ${item.to.id}, epoch ${item.to.epoch}\n${item.updates.map(u=>`${new Date(u.timestamp).toLocaleTimeString()} ${u.status} · ${u.reporter}`).join('\n')}`; meta.style.whiteSpace='pre-wrap'; more.append(meta);
+  for (const key of ['linkedTo','replyTo','retryOf','supersedes']) if (item[key]) more.append(document.createElement('br'),link(`${key}: ${key==='linkedTo' ? item.messageId : item[key]}`,key==='linkedTo' ? item.messageId : item[key]));
+  if (item.artifacts) { const a=item.artifacts,info=document.createElement('p'); info.textContent=`${a.totalCount} artifacts · ${a.totalBytes} bytes${a.omitted ? ` · ${a.omitted} omitted` : ''}`; more.append(info); const ul=document.createElement('ul'); for (const attachment of a.attachments) { const li=document.createElement('li'); li.textContent=`${attachment.type}: ${attachment.name}`; ul.append(li); } for (const file of a.manifest) { const li=document.createElement('li'); li.textContent=`${file.type}: ${file.path}${file.size===undefined ? ' (size unknown)' : ` (${file.size} bytes)`}`; ul.append(li); } more.append(ul); }
+  entry.append(title,date,body,more); return entry;
+}
+function clampWindow(win) { const width=Math.min(win.offsetWidth,board.clientWidth),height=Math.min(win.offsetHeight,board.clientHeight); win.style.width=`${width}px`; win.style.height=`${height}px`; win.style.left=`${Math.max(0,Math.min(parseFloat(win.style.left)||0,Math.max(0,board.clientWidth-60)))}px`; win.style.top=`${Math.max(0,Math.min(parseFloat(win.style.top)||0,Math.max(0,board.clientHeight-36)))}px`; }
+function refreshWindow(record) {
+  const {body,newButton,type,key}=record, atBottom=body.scrollHeight-body.scrollTop-body.clientHeight<40, oldTop=body.scrollTop;
+  const current=[...items.values()].filter(item=>matches(item,type,key));
+  const wanted=new Set(current.map(item=>item.id)), existing=new Map([...body.children].map(entry=>[entry.dataset.id,entry])); for (const [id,entry] of existing) if (!wanted.has(id)) { entry.remove(); existing.delete(id); }
+  for (const item of current) { let entry=existing.get(item.id); const version=JSON.stringify(item); if (!entry) { entry=message(item); entry.dataset.version=version; body.append(entry); } else if (entry.dataset.version!==version) { const replacement=message(item); replacement.dataset.version=version; replacement.querySelector('details').open=entry.querySelector('details').open; entry.replaceWith(replacement); } }
+  if (!current.length) { body.replaceChildren(); const empty=document.createElement('p'); empty.textContent='No messages in retained history (collector may have restarted or evicted them).'; body.append(empty); }
+  if (atBottom) { body.scrollTop=body.scrollHeight; newButton.hidden=true; } else { body.scrollTop=oldTop; if (current.length>record.count) newButton.hidden=false; } record.count=current.length;
+}
+function openWindow(type,key,opener=document.activeElement) {
+  const id=JSON.stringify([type,key]); if (windows.has(id)) { const record=windows.get(id); record.win.style.zIndex=++topZ; record.win.focus(); return record; }
+  const win=document.createElement('section'); win.className='window'; win.tabIndex=-1; win.style.left=`${25+(windows.size%6)*28}px`; win.style.top=`${25+(windows.size%6)*28}px`; win.style.width=`${Math.min(520,board.clientWidth)}px`; win.style.height=`${Math.min(420,board.clientHeight)}px`; win.style.zIndex=++topZ;
+  const bar=document.createElement('div'); bar.className='window-bar'; bar.tabIndex=0; bar.setAttribute('aria-label','Move conversation window with arrow keys');
+  const title=document.createElement('strong'); title.textContent=type==='agent' ? `Agent: ${label([...items.values()].flatMap(i=>[i.from,i.to]).find(p=>laneKey(p)===key) || {name:'Agent',id:key})}` : `Conversation: ${pairMembers(key).map(k=> { const p=[...items.values()].flatMap(i=>[i.from,i.to]).find(peer=>laneKey(peer)===k); return p ? label(p) : 'Agent'; }).join(' ↔ ')}`;
+  const close=document.createElement('button'); close.textContent='×'; close.setAttribute('aria-label','Close conversation'); close.addEventListener('click',()=> { windows.delete(id); observer.disconnect(); win.remove(); if (opener?.isConnected) opener.focus(); }); bar.append(title,close);
+  const resize=document.createElement('button'); resize.textContent='↘'; resize.title='Resize with arrow keys'; resize.setAttribute('aria-label','Resize window with arrow keys'); resize.addEventListener('keydown',event=> { const delta={ArrowLeft:[-10,0],ArrowRight:[10,0],ArrowUp:[0,-10],ArrowDown:[0,10]}[event.key]; if (!delta) return; event.stopPropagation(); event.preventDefault(); win.style.width=`${Math.max(Math.min(320,board.clientWidth),Math.min(board.clientWidth,win.offsetWidth+delta[0]))}px`; win.style.height=`${Math.max(Math.min(220,board.clientHeight),Math.min(board.clientHeight,win.offsetHeight+delta[1]))}px`; }); bar.append(resize);
+  const body=document.createElement('div'); body.className='window-body'; const newButton=document.createElement('button'); newButton.className='new'; newButton.textContent='New messages ↓'; newButton.hidden=true; newButton.addEventListener('click',()=> { body.scrollTop=body.scrollHeight; newButton.hidden=true; });
+  win.append(bar,body,newButton); layer.append(win); clampWindow(win);
+  const record={ win,body,newButton,type,key,count:0 }; windows.set(id,record); refreshWindow(record); win.focus();
+  win.addEventListener('pointerdown',()=> { win.style.zIndex=++topZ; });
+  bar.addEventListener('pointerdown',event=> { if (event.target.closest('button')) return; event.preventDefault(); bar.setPointerCapture(event.pointerId); const px=event.clientX,py=event.clientY,left=parseFloat(win.style.left),top=parseFloat(win.style.top); const move=e=> { win.style.left=`${left+e.clientX-px}px`; win.style.top=`${top+e.clientY-py}px`; clampWindow(win); }; bar.addEventListener('pointermove',move); bar.addEventListener('pointerup',()=>bar.removeEventListener('pointermove',move),{once:true}); });
+  bar.addEventListener('keydown',event=> { if (event.target!==bar) return; const delta={ArrowLeft:[-10,0],ArrowRight:[10,0],ArrowUp:[0,-10],ArrowDown:[0,10]}[event.key]; if (!delta) return; event.preventDefault(); win.style.left=`${parseFloat(win.style.left)+delta[0]}px`; win.style.top=`${parseFloat(win.style.top)+delta[1]}px`; clampWindow(win); });
+  win.addEventListener('keydown',event=> { if (event.key==='Escape') { event.preventDefault(); close.click(); } });
+  const observer=new ResizeObserver(()=>clampWindow(win)); observer.observe(win);
+  return record;
+}
+function focusMessage(id) { for (const record of windows.values()) { const entry=[...record.body.children].find(child=>child.dataset.id===id); if (entry) { record.win.style.zIndex=++topZ; entry.scrollIntoView({block:'center'}); entry.style.background='var(--subpanel)'; setTimeout(()=>entry.style.background='',1500); return; } } }
+function animateConnection(item) {
+  if (!['send','ask','reply'].includes(item.action)) return;
+  const line=lines.get(pairKey(laneKey(item.from),laneKey(item.to)));
+  if (!line) return;
+  clearTimeout(line.pulseTimer);
+  line.classList.remove('sending');
+  void line.getBoundingClientRect(); // restart the dash animation for consecutive messages
+  line.classList.add('sending');
+  line.pulseTimer=setTimeout(()=>line.classList.remove('sending'),1800);
+}
+function reconcile() {
+  $('#count').textContent=`${items.size} interaction${items.size===1 ? '' : 's'}`;
+  const peers=new Map(),pairs=new Map(); for (const item of items.values()) { for (const peer of [item.from,item.to]) { const key=laneKey(peer); if (peer.hostname || !peers.get(key)?.hostname) peers.set(key,peer); } const from=laneKey(item.from),to=laneKey(item.to),key=pairKey(from,to),counts=pairs.get(key)||[0,0]; counts[from<=to ? 0 : 1]++; pairs.set(key,counts); }
+  for (const [key,state] of presence) peers.set(key,state.peer.hostname?.trim() ? state.peer : peers.get(key) || state.peer);
+  for (const [key,peer] of peers) if (!peer.hostname?.trim()) peers.delete(key);
+  for (const key of pairs.keys()) if (pairMembers(key).some(member=>!peers.has(member))) pairs.delete(key);
+  for (const key of positions.keys()) if (!peers.has(key)) { positions.delete(key); layoutVersions.delete(key); }
+  for (const [key,card] of cards) if (!peers.has(key)) { card.remove(); cards.delete(key); }
+  machineOf.clear(); for (const [key,peer] of peers) machineOf.set(key,machineKey(peer));
+  for (const [machine,frame] of groups) if (![...machineOf.values()].includes(machine)) { frame.remove(); groups.delete(machine); }
+  for (const machine of new Set(machineOf.values())) {
+    const count=[...machineOf.values()].filter(value=>value===machine).length;
+    let frame=groups.get(machine);
+    if (!frame) {
+      frame=document.createElement('div'); frame.className='machine-frame';
+      const title=document.createElement('button'); title.className='machine-title'; frame.append(title); groupLayer.append(frame); groups.set(machine,frame);
+      title.addEventListener('pointerdown',event=> { if (event.button!==0) return; event.stopPropagation(); title.setPointerCapture(event.pointerId); moving={group:machine,startX:event.clientX,startY:event.clientY,dx:0,dy:0}; });
+      title.addEventListener('pointermove',event=> { if (moving?.group!==machine) return; const dx=(event.clientX-moving.startX)/zoom,dy=(event.clientY-moving.startY)/zoom; moveGroup(machine,dx-moving.dx,dy-moving.dy); moving.dx=dx; moving.dy=dy; title.classList.add('dragging'); });
+      title.addEventListener('pointerup',event=> { if (moving?.group!==machine) return; const dx=(event.clientX-moving.startX)/zoom,dy=(event.clientY-moving.startY)/zoom; moveGroup(machine,dx-moving.dx,dy-moving.dy); moving=null; title.classList.remove('dragging'); publishGroup(machine,dx,dy); });
+      title.addEventListener('pointercancel',()=> { if (moving?.group===machine) { const {dx,dy}=moving; moving=null; title.classList.remove('dragging'); publishGroup(machine,dx,dy); } });
+      title.addEventListener('keydown',event=> { const delta={ArrowLeft:[-10,0],ArrowRight:[10,0],ArrowUp:[0,-10],ArrowDown:[0,10]}[event.key]; if (!delta) return; event.preventDefault(); moveGroup(machine,...delta); publishGroup(machine,...delta); });
+    }
+    frame.firstElementChild.textContent=`${machine} · ${count} agent${count===1?'':'s'}`;
+    frame.firstElementChild.setAttribute('aria-label',`Move machine ${machine} (${count} agents). Use arrow keys to reposition.`);
+  }
+  for (const [key,peer] of peers) { if (!positions.has(key)) { const index=positions.size; positions.set(key,[(index%4)*260,Math.floor(index/4)*180]); }
+    let card=cards.get(key);
+    if (card) { card.querySelector('strong').textContent=peer.name||'Agent'; card.classList.toggle('working',presence.get(key)?.active===true); card.title=`${peer.id}, epoch ${peer.epoch} · ${presence.has(key) ? (presence.get(key).active ? 'working' : 'idle') : 'activity unknown'}`; card.setAttribute('aria-label',`${label(peer)} · ${presence.has(key) ? (presence.get(key).active ? 'working' : 'idle') : 'activity unknown'}`); continue; }
+    card=document.createElement('button'); card.className='agent'; card.classList.toggle('working',presence.get(key)?.active===true); card.title=`${peer.id}, epoch ${peer.epoch} · ${presence.has(key) ? (presence.get(key).active ? 'working' : 'idle') : 'activity unknown'}`; card.setAttribute('aria-label',`${label(peer)} · ${presence.has(key) ? (presence.get(key).active ? 'working' : 'idle') : 'activity unknown'}`); const strong=document.createElement('strong'),small=document.createElement('small'); strong.textContent=peer.name||'Agent'; small.textContent=peer.id.slice(0,8); card.append(strong,small); agents.append(card); cards.set(key,card);
+    let suppressClick=false;
+    card.addEventListener('click',()=> { if (suppressClick) { suppressClick=false; return; } openWindow('agent',key,card); });
+    card.addEventListener('pointerdown',event=> { if (event.button!==0) return; event.stopPropagation(); card.setPointerCapture(event.pointerId); const [px,py]=positions.get(key); moving={card,key,startX:event.clientX,startY:event.clientY,px,py,dragged:false}; });
+    card.addEventListener('pointermove',event=> { if (moving?.card!==card) return; const dx=event.clientX-moving.startX,dy=event.clientY-moving.startY; if (Math.hypot(dx,dy)>4) moving.dragged=true; if (moving.dragged) { positions.set(key,[moving.px+dx/zoom,moving.py+dy/zoom]); card.classList.add('dragging'); paint(); publishPosition(key); } });
+    card.addEventListener('pointerup',event=> { if (moving?.card!==card) return; const dragged=moving.dragged; moving=null; card.classList.remove('dragging'); if (dragged) { suppressClick=true; setTimeout(()=> { suppressClick=false; },0); publishPosition(key,true); } });
+    card.addEventListener('keydown',event=> { const delta={ArrowLeft:[-10,0],ArrowRight:[10,0],ArrowUp:[0,-10],ArrowDown:[0,10]}[event.key]; if (!delta) return; event.preventDefault(); const [px,py]=positions.get(key); positions.set(key,[px+delta[0],py+delta[1]]); paint(); publishPosition(key,true); });
+  }
+  for (const [key,line] of lines) if (!pairs.has(key)) { clearTimeout(line.pulseTimer); line.remove(); lines.delete(key); }
+  for (const [key,counts] of pairs) { let line=lines.get(key); if (!line) { line=document.createElementNS(NS,'g'); line.classList.add('edge'); line.setAttribute('role','button'); line.setAttribute('tabindex','0'); for (const name of ['visible','hit']) { const path=document.createElementNS(NS,'path'); path.classList.add(name); line.append(path); } line.append(document.createElementNS(NS,'text')); edges.append(line); lines.set(key,line); line.addEventListener('click',()=>openWindow('pair',key,line)); line.addEventListener('keydown',event=> { if (event.key==='Enter'||event.key===' ') { event.preventDefault(); openWindow('pair',key,line); } }); } line.querySelector('text').textContent=pairMembers(key)[0]===pairMembers(key)[1] ? `${counts[0]} loop` : `${counts[0]} → · ${counts[1]} ←`; line.setAttribute('aria-label',`${counts[0]+counts[1]} interactions between agents. Open conversation`); }
+  const list=$('#text-events'); list.replaceChildren(); for (const item of items.values()) { const li=document.createElement('li'),button=document.createElement('button'); button.textContent=`${label(item.from)} → ${label(item.to)}: intercom.${item.action}, ${item.status}`; button.addEventListener('click',()=> { openWindow('pair',pairKey(laneKey(item.from),laneKey(item.to)),button); focusMessage(item.id); }); li.append(button); list.append(li); }
+  paint(); for (const record of windows.values()) refreshWindow(record); notice(); save();
+}
+board.addEventListener('pointerdown',event=> { if (event.button!==0 || event.target.closest('.window,#list-panel,.agent,.edge,.machine-title')) return; board.setPointerCapture(event.pointerId); moving={startX:event.clientX,startY:event.clientY,px:x,py:y}; board.classList.add('panning'); });
+board.addEventListener('pointermove',event=> { if (!moving || moving.card || moving.group) return; x=moving.px+event.clientX-moving.startX; y=moving.py+event.clientY-moving.startY; camera(); });
+board.addEventListener('pointerup',()=> { if (!moving?.card && !moving?.group) { moving=null; board.classList.remove('panning'); } });
+board.addEventListener('wheel',event=> { if (event.target.closest('.window,#list-panel')) return; event.preventDefault(); if (event.ctrlKey || event.metaKey) { const rect=board.getBoundingClientRect(); setZoom(zoom*Math.exp(-event.deltaY*.002),event.clientX-rect.left,event.clientY-rect.top); } else { x-=event.deltaX; y-=event.deltaY; camera(); } },{passive:false});
+$('#zoom-in').addEventListener('click',()=>setZoom(zoom*1.25)); $('#zoom-out').addEventListener('click',()=>setZoom(zoom/1.25)); $('#zoom-reset').addEventListener('click',()=>setZoom(1)); $('#fit').addEventListener('click',fit); $('#layout-reset').addEventListener('click',async()=> { try { const result=await fetch('/layout/reset',{method:'POST'}); if (!result.ok) throw new Error('Reset failed'); } catch { $('#notice').textContent='Could not reset shared layout.'; } });
+window.addEventListener('resize',()=> { for (const record of windows.values()) clampWindow(record.win); }); camera();
+const stream=new EventSource('/events');
+stream.addEventListener('open',()=> { $('#connection').textContent='Live'; $('#connection').classList.add('live'); });
+stream.addEventListener('error',()=> { $('#connection').textContent='Reconnecting…'; $('#connection').classList.remove('live'); });
+stream.addEventListener('snapshot',event=> { try { const data=JSON.parse(event.data); items.clear(); presence.clear(); positions.clear(); layoutVersions.clear(); for (const [key,position] of data.layout || []) { positions.set(key,position); layoutVersions.set(key,data.layoutRevision || 0); } for (const item of data.interactions) items.set(item.id,item); for (const state of data.presence || []) presence.set(laneKey(state.peer),state); truncated=data.truncated; partial=data.partial; connected=data.connectedReporters ?? 0; reconcile(); } catch { $('#notice').textContent='Invalid telemetry snapshot'; } });
+stream.addEventListener('interaction',event=> { try { const data=JSON.parse(event.data), previous=items.get(data.interaction.id); if (data.evicted) items.delete(data.evicted); items.set(data.interaction.id,data.interaction); truncated=data.truncated; partial=data.partial; reconcile(); if (!previous || previous.action==='receipt' && data.interaction.action!=='receipt') animateConnection(data.interaction); } catch { $('#notice').textContent='Invalid telemetry update'; } });
+stream.addEventListener('presence',event=> { try { const state=JSON.parse(event.data),key=laneKey(state.peer); if (state.connected) presence.set(key,state); else presence.delete(key); reconcile(); } catch { $('#notice').textContent='Invalid agent activity'; } });
+stream.addEventListener('layout',event=> { try { const update=JSON.parse(event.data); if (update.positions || update.moved) { for (const [key,position] of update.positions || update.moved) acceptPosition(key,position,update.revision); } else acceptPosition(update.key,update.position,update.revision); paint(); } catch { $('#notice').textContent='Invalid shared layout'; } });
+stream.addEventListener('status',event=> { try { const status=JSON.parse(event.data); if (Number.isSafeInteger(status.connectedReporters)) connected=status.connectedReporters; partial ||= !!status.partial; truncated ||= !!status.truncated; notice(); } catch { $('#notice').textContent='Invalid telemetry status'; } });
+</script>
+</body>
+</html>
